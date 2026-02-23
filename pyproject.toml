@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "umabot"
+version = "0.1.0"
+description = "UMA BOT - self-hosted personal AI assistant"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "UMA BOT Contributors" }
+]
+keywords = ["assistant", "bot", "ai", "telegram", "discord"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "PyYAML>=6.0",
+  "jsonschema>=4.18.0",
+  "aiohttp>=3.9.0",
+  "telethon>=1.34.0",
+  "qrcode>=7.4.2",
+  "questionary>=2.0.1",
+  "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+discord = ["discord.py>=2.3.2"]
+
+[project.scripts]
+umabot = "umabot.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["umabot*"]

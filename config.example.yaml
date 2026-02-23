@@ -1,0 +1,49 @@
+# UMA BOT Configuration Example
+# Clean architecture: Control Panel + Connectors
+
+# AI Provider
+llm:
+  provider: openai
+  model: gpt-4o
+  api_key: null
+
+# Control Panel - YOUR Private Interface
+# (Separate from message connectors!)
+control_panel:
+  enabled: true
+  ui_type: telegram  # telegram | discord | cli | web
+  connector: control_panel_bot
+  chat_id: "123456789"
+
+# Message Connectors - External Sources
+connectors:
+  - name: control_panel_bot
+    type: telegram_bot
+    token: null
+
+  - name: public_telegram
+    type: telegram_bot
+    token: null
+
+# Tools
+tools:
+  shell_enabled: false
+
+# Policy
+policy:
+  confirmation_strictness: normal
+
+# Storage
+storage:
+  db_path: ~/.umabot/umabot.db
+  vault_dir: ~/.umabot/vault
+
+# Runtime
+runtime:
+  pid_file: ~/.umabot/umabot.pid
+  log_dir: ~/.umabot/logs
+  ws_host: 127.0.0.1
+  ws_port: 8765
+  ws_token: null
+
+# See ARCHITECTURE.md for detailed explanation!
