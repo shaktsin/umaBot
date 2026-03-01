@@ -192,7 +192,7 @@ def main() -> None:
     elif args.command == "orchestrate":
         from umabot.orchestrator import main as orchestrate_main
 
-        orchestrate_main()
+        orchestrate_main(config_path=args.config, log_level=args.log_level)
 
     elif args.command == "channels":
         if args.channel == "telegram":

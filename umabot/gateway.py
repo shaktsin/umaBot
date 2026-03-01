@@ -160,9 +160,9 @@ class Gateway:
     async def _on_message(self, message) -> None:
         routed = self._router.route(message)
         if routed.kind == "control":
-            logger.debug("Control message received channel=%s chat_id=%s", message.channel, message.chat_id)
+            logger.debug("Control message received channel=%s", message.channel)
         else:
-            logger.debug("External message received channel=%s chat_id=%s", message.channel, message.chat_id)
+            logger.debug("External message received channel=%s", message.channel)
 
         pending = routed.pending_confirmation
         if pending:
@@ -214,9 +214,9 @@ class Gateway:
         kind_hint = "control" if mode == "control" else None
         routed = self._router.route(message, kind_hint=kind_hint)
         if routed.kind == "control":
-            logger.debug("Control message received channel=%s chat_id=%s", message.channel, message.chat_id)
+            logger.debug("Control message received channel=%s", message.channel)
         else:
-            logger.debug("External message received channel=%s chat_id=%s", message.channel, message.chat_id)
+            logger.debug("External message received channel=%s", message.channel)
 
         pending = routed.pending_confirmation
         if pending:

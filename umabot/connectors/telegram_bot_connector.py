@@ -129,7 +129,7 @@ class TelegramBotConnector(BaseConnector):
                 from datetime import datetime
 
                 self._last_message_at = datetime.utcnow().isoformat()
-                logger.debug(f"Forwarded message from {chat_id} to gateway")
+                logger.debug("Forwarded Telegram message to gateway")
 
     async def _recv_loop(self, ws) -> None:
         """Receive send commands from gateway."""
@@ -152,9 +152,9 @@ class TelegramBotConnector(BaseConnector):
         payload = {"chat_id": chat_id, "text": text}
         try:
             await asyncio.to_thread(self._post, "sendMessage", payload)
-            logger.debug(f"Sent message to {chat_id}")
+            logger.debug("Sent Telegram message")
         except Exception as exc:
-            logger.error(f"Failed to send message to {chat_id}: {exc}")
+            logger.error("Failed to send Telegram message: %s", exc)
 
     def _get(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Make GET request to Telegram Bot API."""

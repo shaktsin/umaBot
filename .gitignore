@@ -218,3 +218,6 @@ skills/
 
 plans/
 docs/
+
+.staging/
+.tests/

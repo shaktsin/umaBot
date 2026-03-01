@@ -96,13 +96,16 @@ class SkillRuntime:
         runtime_cfg = skill.metadata.runtime or {}
         timeout = int(runtime_cfg.get("timeout_seconds", 20))
         env = self._build_env(skill_name)
+        config_args = self.config.skill_configs.get(skill_name, {}).get("args", {})
+        if not isinstance(config_args, dict):
+            config_args = {}
 
         # For bash scripts, pass payload as JSON via stdin
         # For Python scripts, pass payload as JSON via stdin
         stdin_data = json.dumps(
             {
                 "input": payload,
-                "config": self.config.skill_configs.get(skill_name, {}).get("args", {}),
+                "config": config_args,
             }
         ).encode("utf-8")
 
@@ -178,6 +181,15 @@ class SkillRuntime:
             "LC_ALL": "C.UTF-8",
             "PATH": os.environ.get("PATH", ""),
         }
+        # Resolve env vars declared in the skill manifest.
+        # Priority: config.yaml value > host environment variable
+        skill = self.skill_registry.get(skill_name)
+        if skill:
+            declared_env = (skill.metadata.install_config or {}).get("env", {})
+            for key in declared_env:
+                key_str = str(key)
+                if key_str not in env_cfg and key_str in os.environ:
+                    env[key_str] = os.environ[key_str]
         for key, value in env_cfg.items():
             env[str(key)] = str(value)
         return env

@@ -100,13 +100,16 @@ def _get_connector_field(connector, field: str) -> Optional[str]:
     return str(value)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", dest="config", default=None)
-    parser.add_argument("--log-level", dest="log_level", default=None)
-    args = parser.parse_args()
+def main(config_path: str | None = None, log_level: str | None = None) -> None:
+    if config_path is None and log_level is None:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--config", dest="config", default=None)
+        parser.add_argument("--log-level", dest="log_level", default=None)
+        args = parser.parse_args()
+        config_path = args.config
+        log_level = args.log_level
 
-    cfg, config_path = load_config(config_path=args.config)
+    cfg, config_path = load_config(config_path=config_path)
 
     async def runner() -> None:
         processes: List[asyncio.subprocess.Process] = []
@@ -138,9 +141,9 @@ def main() -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _handle_signal)
 
-        processes.append(await _run_process(_gateway_cmd(config_path, args.log_level), "gateway"))
+        processes.append(await _run_process(_gateway_cmd(config_path, log_level), "gateway"))
 
-        for cmd, inherit_stdin in _build_worker_cmds(cfg, config_path, args.log_level):
+        for cmd, inherit_stdin in _build_worker_cmds(cfg, config_path, log_level):
             processes.append(await _run_process(cmd, "worker", inherit_stdin=inherit_stdin))
 
         wait_tasks = [asyncio.create_task(proc.wait()) for proc in processes]

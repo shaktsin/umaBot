@@ -141,9 +141,7 @@ class TelegramUserConnector(BaseConnector):
         sender_id = str(event.sender_id or "")
         text = event.raw_text or ""
 
-        logger.debug(
-            f"Telegram user message chat_id={chat_id} sender_id={sender_id} text_len={len(text)}"
-        )
+        logger.debug("Telegram user message received text_len=%s", len(text))
 
         # Forward to gateway
         await self._ws.send_json(
@@ -268,12 +266,12 @@ def main() -> None:
         api_hash = args.api_hash or connector_cfg.api_hash
         phone = args.phone or connector_cfg.phone
 
-    # Log connector details (mask api_hash for security)
-    if _debug_secrets_enabled():
-        masked_hash = f"***{api_hash[-4:]}" if api_hash and len(api_hash) > 4 else "***"
-        logger.info(f"Resolved api_id={api_id} api_hash={masked_hash} phone={phone}")
-    else:
-        logger.info(f"Resolved api_id={api_id} phone={phone}")
+    logger.info(
+        "Resolved Telegram user credentials api_id_configured=%s api_hash_configured=%s phone_configured=%s",
+        bool(api_id),
+        bool(api_hash),
+        bool(phone),
+    )
 
     if not api_id or not api_hash:
         raise SystemExit("Telegram user connector requires api_id and api_hash")

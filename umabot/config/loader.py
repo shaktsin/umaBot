@@ -366,18 +366,15 @@ def _load_keychain_secrets(cfg: Config) -> None:
     if not cfg.llm.api_key:
         cfg.llm.api_key = _read_keychain_secret("UMABOT_LLM_API_KEY")
         if debug:
-            masked = f"***{cfg.llm.api_key[-4:]}" if cfg.llm.api_key and len(cfg.llm.api_key) > 4 else "***"
-            logger.info("Keychain UMABOT_LLM_API_KEY=%s (loaded)", masked)
+            logger.info("Keychain UMABOT_LLM_API_KEY loaded")
     if not cfg.telegram.token:
         cfg.telegram.token = _read_keychain_secret("UMABOT_TELEGRAM_TOKEN")
         if debug:
-            masked = f"***{cfg.telegram.token[-4:]}" if cfg.telegram.token and len(cfg.telegram.token) > 4 else "***"
-            logger.info("Keychain UMABOT_TELEGRAM_TOKEN=%s (loaded)", masked)
+            logger.info("Keychain UMABOT_TELEGRAM_TOKEN loaded")
     if not cfg.discord.token:
         cfg.discord.token = _read_keychain_secret("UMABOT_DISCORD_TOKEN")
         if debug:
-            masked = f"***{cfg.discord.token[-4:]}" if cfg.discord.token and len(cfg.discord.token) > 4 else "***"
-            logger.info("Keychain UMABOT_DISCORD_TOKEN=%s (loaded)", masked)
+            logger.info("Keychain UMABOT_DISCORD_TOKEN loaded")
 
 
 def _read_keychain_secret(account: str) -> Optional[str]:

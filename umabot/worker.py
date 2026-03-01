@@ -116,9 +116,8 @@ class Worker:
             tools_spec = _build_tool_specs(self.tool_registry, allowed_tools, self.skill_registry, dynamic_tool_map)
 
             logger.debug(
-                "LLM request kind=%s chat_id=%s session_id=%s messages=%s tools=%s ctx_rev=%s dyn_tools=%s",
+                "LLM request kind=%s session_id=%s messages=%s tools=%s ctx_rev=%s dyn_tools=%s",
                 kind,
-                chat_id,
                 session_id,
                 len(messages),
                 len(tools_spec),
@@ -128,12 +127,11 @@ class Worker:
             try:
                 response = await self.llm_client.generate(messages, tools=tools_spec)
             except Exception as exc:
-                logger.exception("LLM request failed chat_id=%s error=%s", chat_id, exc)
+                logger.exception("LLM request failed kind=%s error=%s", kind, exc)
                 await self.send_message(channel, chat_id, "LLM request failed. Check logs.")
                 return
             logger.debug(
-                "LLM response chat_id=%s content_len=%s tool_calls=%s",
-                chat_id,
+                "LLM response content_len=%s tool_calls=%s",
                 len(response.content or ""),
                 len(response.tool_calls),
             )
@@ -144,8 +142,7 @@ class Worker:
                     input_obj = call.arguments.get("input")
                     input_keys = sorted(list(input_obj.keys())) if isinstance(input_obj, dict) else []
                     logger.debug(
-                        "LLM skill-call preview chat_id=%s skill=%s script=%s input_keys=%s has_input=%s",
-                        chat_id,
+                        "LLM skill-call preview skill=%s script=%s input_keys=%s has_input=%s",
                         call.arguments.get("skill"),
                         script_name,
                         input_keys,
@@ -154,8 +151,7 @@ class Worker:
                     if script_name == "create":
                         has_title = isinstance(input_obj, dict) and bool(str(input_obj.get("title", "")).strip())
                         logger.debug(
-                            "LLM skill-call create validation chat_id=%s has_title=%s",
-                            chat_id,
+                            "LLM skill-call create validation has_title=%s",
                             has_title,
                         )
             assistant_message_id = self.db.add_message(
