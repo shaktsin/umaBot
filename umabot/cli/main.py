@@ -133,6 +133,15 @@ def main() -> None:
     tasks_cancel_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
     tasks_cancel_parser.add_argument("id", type=int)
 
+    # Control panel management
+    control_panel_parser = subparsers.add_parser("control-panel", help="Manage control panel")
+    control_panel_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
+    control_panel_parser.add_argument("--log-level", dest="log_level", default=None, help="Logging level")
+    control_panel_subparsers = control_panel_parser.add_subparsers(dest="control_panel_command")
+    control_panel_setup_parser = control_panel_subparsers.add_parser("setup", help="Interactive setup to get Telegram chat ID automatically")
+    control_panel_setup_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
+    control_panel_setup_parser.add_argument("--log-level", dest="log_level", default=None, help="Logging level")
+
     args = parser.parse_args()
 
     # Route to command handlers
@@ -208,6 +217,11 @@ def main() -> None:
         from umabot.cli.tasks import handle_tasks
 
         handle_tasks(args)
+
+    elif args.command == "control-panel":
+        from umabot.cli.control_panel_setup import run_setup
+
+        run_setup(config_path=args.config)
 
     else:
         parser.print_help()

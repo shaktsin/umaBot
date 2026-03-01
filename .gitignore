@@ -215,3 +215,6 @@ wa_session/
 *.pid
 config.example.yaml.bak
 skills/
+
+plans/
+docs/

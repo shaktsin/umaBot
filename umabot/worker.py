@@ -12,7 +12,7 @@ from umabot.skills import SkillRegistry
 from umabot.storage import Database, Queue
 from umabot.tasks.parser import parse_control_task_request
 from umabot.tasks.schedule import compute_initial_next_run_at, compute_next_run_at
-from umabot.tools import ToolRegistry
+from umabot.tools import ToolRegistry, UnifiedToolRegistry
 
 
 logger = logging.getLogger("umabot.worker")
@@ -28,6 +28,7 @@ class Worker:
         tool_registry: ToolRegistry,
         policy: PolicyEngine,
         skill_registry: SkillRegistry,
+        unified_registry: UnifiedToolRegistry,
         send_message,
         send_control_message,
     ) -> None:
@@ -37,6 +38,7 @@ class Worker:
         self.tool_registry = tool_registry
         self.policy = policy
         self.skill_registry = skill_registry
+        self.unified_registry = unified_registry
         self.send_message = send_message
         self.send_control_message = send_control_message
         self._stop = asyncio.Event()
@@ -135,7 +137,7 @@ class Worker:
                 len(response.content or ""),
                 len(response.tool_calls),
             )
-            logger.debug("LLM response content chat_id=%s content=%s", chat_id, response.content)
+            # Security: Do NOT log response.content - may contain sensitive user data
             for call in response.tool_calls:
                 if call.name == "skills.run_script" or call.name.startswith("skill_"):
                     script_name = str(call.arguments.get("script", "")).strip()
@@ -168,7 +170,9 @@ class Worker:
 
             tool_results = []
             for tool_call in response.tool_calls:
-                logger.debug("Tool call requested name=%s args=%s", tool_call.name, tool_call.arguments)
+                # Security: Log only tool name and arg count, NOT actual arguments (may contain sensitive data)
+                arg_count = len(tool_call.arguments) if isinstance(tool_call.arguments, dict) else 0
+                logger.debug("Tool call requested name=%s arg_count=%s", tool_call.name, arg_count)
                 effective_name = tool_call.name
                 effective_args = tool_call.arguments
                 if tool_call.name in dynamic_tool_map:
@@ -195,7 +199,9 @@ class Worker:
                     messages=messages,
                 )
                 if decision.require_confirmation:
-                    logger.info("Tool confirmation required name=%s token=%s", tool_call.name, decision.token)
+                    # Hash token for logging (security: don't log plaintext tokens)
+                    token_hash = hashlib.sha256(decision.token.encode()).hexdigest()[:8]
+                    logger.info("Tool confirmation required name=%s token_hash=%s", tool_call.name, token_hash)
                     prompt = f"Reply YES {decision.token} to confirm"
                     await self.send_control_message(channel, chat_id, prompt)
                     self.db.add_audit(

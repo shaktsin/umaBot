@@ -13,6 +13,8 @@ from typing import Optional
 from umabot.config import load_config, parse_override_args, run_wizard
 from umabot.skills import SkillRegistry, lint_skill_dir
 from umabot.skills.loader import load_skill_metadata
+from umabot.skills.installer import SkillInstaller
+from umabot.cli.control_panel_setup import run_setup as run_control_panel_setup
 
 
 def main() -> None:
@@ -63,12 +65,17 @@ def main() -> None:
     skills_parser = subparsers.add_parser("skills", help="Manage skills")
     skills_sub = skills_parser.add_subparsers(dest="skills_command")
     skills_sub.add_parser("list", help="List installed skills")
-    install_parser = skills_sub.add_parser("install", help="Install skill from path")
-    install_parser.add_argument("path")
+    install_parser = skills_sub.add_parser("install", help="Install skill from PyPI, GitHub, or local path")
+    install_parser.add_argument("source", help="PyPI package, GitHub URL, or local path")
+    install_parser.add_argument("--name", help="Custom skill name (optional)")
     remove_parser = skills_sub.add_parser("remove", help="Remove installed skill")
     remove_parser.add_argument("name")
     lint_parser = skills_sub.add_parser("lint", help="Lint skills")
     lint_parser.add_argument("path", nargs="?")
+
+    control_panel_parser = subparsers.add_parser("control-panel", help="Manage control panel")
+    control_panel_sub = control_panel_parser.add_subparsers(dest="control_panel_command")
+    control_panel_sub.add_parser("setup", help="Interactive setup to get Telegram chat ID automatically")
 
     args = parser.parse_args()
 
@@ -95,6 +102,9 @@ def main() -> None:
         return
     if args.command == "skills":
         _handle_skills(args)
+        return
+    if args.command == "control-panel":
+        _handle_control_panel(args)
         return
 
     parser.print_help()
@@ -224,36 +234,69 @@ def _wait_for_exit(pid: int, pid_file: Path) -> None:
     print("UMA BOT stop requested, but process is still running")
 
 
+def _handle_control_panel(args) -> None:
+    if args.control_panel_command == "setup":
+        run_control_panel_setup(args.config)
+        return
+
+    print("Unknown control-panel command")
+
+
 def _handle_skills(args) -> None:
     base_dirs = [Path.cwd() / "skills", Path.home() / ".umabot" / "skills"]
+    skills_dir = base_dirs[1]  # Use ~/.umabot/skills as default installation directory
+
     if args.skills_command == "list":
+        installer = SkillInstaller(skills_dir)
+        installed = installer.list_installed()
+
+        if not installed:
+            print("No skills installed.")
+            print(f"\nInstall skills with: umabot skills install <source>")
+            print(f"  - From PyPI: umabot skills install umabot-skill-github")
+            print(f"  - From GitHub: umabot skills install https://github.com/user/skill.git")
+            print(f"  - From path: umabot skills install ./my-skill")
+            return
+
+        print(f"Installed skills ({len(installed)}):\n")
         registry = SkillRegistry()
         registry.load_from_dirs(base_dirs)
         for skill in registry.list():
-            print(f"{skill.metadata.name} {skill.metadata.version} - {skill.metadata.description}")
+            scripts_count = len(skill.metadata.scripts)
+            print(f"  {skill.metadata.name} ({skill.metadata.version})")
+            print(f"    {skill.metadata.description}")
+            print(f"    Scripts: {scripts_count}")
+            print(f"    Path: {skill.path}")
+            print()
         return
 
     if args.skills_command == "install":
-        source = Path(args.path).expanduser().resolve()
-        metadata = load_skill_metadata(source)
-        if not metadata:
-            print("Invalid skill: missing or invalid SKILL.md")
-            return
-        target_dir = base_dirs[1] / metadata.name
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
-        shutil.copytree(source, target_dir)
-        print(f"Installed skill {metadata.name}")
+        installer = SkillInstaller(skills_dir)
+        source = args.source
+        custom_name = getattr(args, 'name', None)
+
+        print(f"Installing skill from: {source}")
+        if custom_name:
+            print(f"Custom name: {custom_name}")
+
+        success, message = installer.install(source, custom_name)
+        if success:
+            print(f"✓ {message}")
+            print(f"\nReload the bot to activate: umabot reload")
+        else:
+            print(f"✗ Installation failed: {message}")
+            sys.exit(1)
         return
 
     if args.skills_command == "remove":
-        target_dir = base_dirs[1] / args.name
-        if not target_dir.exists():
-            print("Skill not found")
-            return
-        shutil.rmtree(target_dir)
-        print(f"Removed skill {args.name}")
+        installer = SkillInstaller(skills_dir)
+        success, message = installer.uninstall(args.name)
+        if success:
+            print(f"✓ {message}")
+            print(f"\nReload the bot: umabot reload")
+        else:
+            print(f"✗ {message}")
+            sys.exit(1)
         return
 
     if args.skills_command == "lint":

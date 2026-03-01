@@ -17,7 +17,7 @@ from umabot.scheduler import TaskScheduler
 from umabot.skills import SkillRegistry
 from umabot.skills.runtime import SkillRuntime
 from umabot.storage import Database, Queue
-from umabot.tools import ToolRegistry, register_builtin_tools, register_skill_tools
+from umabot.tools import ToolRegistry, UnifiedToolRegistry, register_builtin_tools, register_skill_tools
 from umabot.worker import Worker
 from umabot.ws import ChannelHub, WebsocketGateway
 
@@ -36,6 +36,7 @@ class Gateway:
         tool_registry: ToolRegistry,
         policy: PolicyEngine,
         skill_registry: SkillRegistry,
+        unified_registry: UnifiedToolRegistry,
     ) -> None:
         self.config = config
         self.config_path = config_path
@@ -45,6 +46,7 @@ class Gateway:
         self.tool_registry = tool_registry
         self.policy = policy
         self.skill_registry = skill_registry
+        self.unified_registry = unified_registry
 
         # Control panel manager (new architecture)
         self._control_panel = ControlPanelManager(config.control_panel, self)
@@ -72,6 +74,7 @@ class Gateway:
             tool_registry=tool_registry,
             policy=policy,
             skill_registry=skill_registry,
+            unified_registry=unified_registry,
             send_message=self.send_message,
             send_control_message=self.send_control_message,
         )
@@ -91,7 +94,7 @@ class Gateway:
 
     async def reload(self) -> None:
         logger.info("Reloading configuration")
-        config, config_path, tool_registry, policy, skill_registry = _reload_runtime(
+        config, config_path, tool_registry, policy, skill_registry, unified_registry = _reload_runtime(
             self.config_path, overrides=self.overrides
         )
         self.config = config
@@ -99,6 +102,7 @@ class Gateway:
         self.tool_registry = tool_registry
         self.policy = policy
         self.skill_registry = skill_registry
+        self.unified_registry = unified_registry
         self.control_channel = (config.runtime.control_channel or "").strip()
         self.control_chat_id = config.runtime.control_chat_id
         self.control_connector = config.runtime.control_connector
@@ -121,6 +125,7 @@ class Gateway:
             tool_registry=tool_registry,
             policy=policy,
             skill_registry=skill_registry,
+            unified_registry=unified_registry,
             send_message=self.send_message,
             send_control_message=self.send_control_message,
         )
@@ -289,6 +294,11 @@ def build_runtime(config_path: Optional[str] = None, overrides: Optional[Dict[st
         Path.cwd() / "skills",
         Path.home() / ".umabot" / "skills",
     ])
+
+    # Create skill runtime
+    skill_runtime = SkillRuntime(skill_registry=skill_registry, config=config)
+
+    # Legacy tool registry (for PolicyEngine compatibility)
     tool_registry = ToolRegistry()
     register_builtin_tools(
         tool_registry,
@@ -296,10 +306,22 @@ def build_runtime(config_path: Optional[str] = None, overrides: Optional[Dict[st
     )
     register_skill_tools(
         tool_registry,
-        runtime=SkillRuntime(skill_registry=skill_registry, config=config),
+        runtime=skill_runtime,
     )
+
+    # New unified tool registry
+    unified_registry = UnifiedToolRegistry()
+
+    # Register built-in tools
+    for tool in tool_registry.list().values():
+        unified_registry.register_builtin(tool)
+
+    # Connect skill system
+    unified_registry.set_skill_registry(skill_registry)
+    unified_registry.set_skill_runtime(skill_runtime)
+
     policy = PolicyEngine(tool_registry, strictness=config.policy.confirmation_strictness)
-    return config, resolved_path, db, queue, tool_registry, policy, skill_registry
+    return config, resolved_path, db, queue, tool_registry, policy, skill_registry, unified_registry
 
 
 def _reload_runtime(config_path: str, overrides: Optional[Dict[str, str]] = None):
@@ -309,6 +331,11 @@ def _reload_runtime(config_path: str, overrides: Optional[Dict[str, str]] = None
         Path.cwd() / "skills",
         Path.home() / ".umabot" / "skills",
     ])
+
+    # Create skill runtime
+    skill_runtime = SkillRuntime(skill_registry=skill_registry, config=config)
+
+    # Legacy tool registry (for PolicyEngine compatibility)
     tool_registry = ToolRegistry()
     register_builtin_tools(
         tool_registry,
@@ -316,10 +343,22 @@ def _reload_runtime(config_path: str, overrides: Optional[Dict[str, str]] = None
     )
     register_skill_tools(
         tool_registry,
-        runtime=SkillRuntime(skill_registry=skill_registry, config=config),
+        runtime=skill_runtime,
     )
+
+    # New unified tool registry
+    unified_registry = UnifiedToolRegistry()
+
+    # Register built-in tools
+    for tool in tool_registry.list().values():
+        unified_registry.register_builtin(tool)
+
+    # Connect skill system
+    unified_registry.set_skill_registry(skill_registry)
+    unified_registry.set_skill_runtime(skill_runtime)
+
     policy = PolicyEngine(tool_registry, strictness=config.policy.confirmation_strictness)
-    return config, resolved_path, tool_registry, policy, skill_registry
+    return config, resolved_path, tool_registry, policy, skill_registry, unified_registry
 
 
 def main() -> None:
@@ -349,7 +388,7 @@ def main() -> None:
     )
 
     override_map = _parse_overrides(args.overrides)
-    config, config_path, db, queue, tool_registry, policy, skill_registry = build_runtime(
+    config, config_path, db, queue, tool_registry, policy, skill_registry, unified_registry = build_runtime(
         config_path=args.config,
         overrides=override_map,
     )
@@ -363,6 +402,7 @@ def main() -> None:
         tool_registry=tool_registry,
         policy=policy,
         skill_registry=skill_registry,
+        unified_registry=unified_registry,
     )
 
     async def runner():

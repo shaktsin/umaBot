@@ -303,14 +303,14 @@ def _strip_secrets(data: Dict[str, Any]) -> None:
     for channel in ("telegram", "discord", "whatsapp"):
         if channel in data and isinstance(data[channel], dict):
             data[channel]["token"] = None
-    # NOTE: We keep connector tokens in the config for now
-    # TODO: Store connector secrets in keychain/env and load them back
-    # if "connectors" in data and isinstance(data["connectors"], list):
-    #     for connector in data["connectors"]:
-    #         if isinstance(connector, dict):
-    #             connector["token"] = None
-    #             connector["api_id"] = None
-    #             connector["api_hash"] = None
+    # Strip connector secrets from config file
+    # NOTE: Use environment variables instead: UMABOT_CONNECTOR_<NAME>_TOKEN
+    if "connectors" in data and isinstance(data["connectors"], list):
+        for connector in data["connectors"]:
+            if isinstance(connector, dict):
+                connector["token"] = None
+                connector["api_id"] = None
+                connector["api_hash"] = None
 
 
 def _store_secrets(api_key: str, telegram_token: str, discord_token: str) -> None:
@@ -331,7 +331,10 @@ def _store_secrets(api_key: str, telegram_token: str, discord_token: str) -> Non
 
 def _store_env_secrets(api_key: str, telegram_token: str, discord_token: str) -> None:
     env_path = DEFAULT_ENV_PATHS[-1]
-    env_path.parent.mkdir(parents=True, exist_ok=True)
+    # Create parent directory with restrictive permissions (user-only access)
+    env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Ensure parent directory has correct permissions even if it already existed
+    os.chmod(env_path.parent, 0o700)
     lines = []
     if api_key:
         lines.append(f"UMABOT_LLM_API_KEY={api_key}")
@@ -340,6 +343,7 @@ def _store_env_secrets(api_key: str, telegram_token: str, discord_token: str) ->
     if discord_token:
         lines.append(f"UMABOT_DISCORD_TOKEN={discord_token}")
     env_path.write_text("\n".join(lines) + "\n")
+    # Set file permissions to user-only read/write
     os.chmod(env_path, 0o600)
 
 
@@ -362,15 +366,18 @@ def _load_keychain_secrets(cfg: Config) -> None:
     if not cfg.llm.api_key:
         cfg.llm.api_key = _read_keychain_secret("UMABOT_LLM_API_KEY")
         if debug:
-            logger.info("Keychain UMABOT_LLM_API_KEY=%s", cfg.llm.api_key)
+            masked = f"***{cfg.llm.api_key[-4:]}" if cfg.llm.api_key and len(cfg.llm.api_key) > 4 else "***"
+            logger.info("Keychain UMABOT_LLM_API_KEY=%s (loaded)", masked)
     if not cfg.telegram.token:
         cfg.telegram.token = _read_keychain_secret("UMABOT_TELEGRAM_TOKEN")
         if debug:
-            logger.info("Keychain UMABOT_TELEGRAM_TOKEN=%s", cfg.telegram.token)
+            masked = f"***{cfg.telegram.token[-4:]}" if cfg.telegram.token and len(cfg.telegram.token) > 4 else "***"
+            logger.info("Keychain UMABOT_TELEGRAM_TOKEN=%s (loaded)", masked)
     if not cfg.discord.token:
         cfg.discord.token = _read_keychain_secret("UMABOT_DISCORD_TOKEN")
         if debug:
-            logger.info("Keychain UMABOT_DISCORD_TOKEN=%s", cfg.discord.token)
+            masked = f"***{cfg.discord.token[-4:]}" if cfg.discord.token and len(cfg.discord.token) > 4 else "***"
+            logger.info("Keychain UMABOT_DISCORD_TOKEN=%s (loaded)", masked)
 
 
 def _read_keychain_secret(account: str) -> Optional[str]:

@@ -268,8 +268,10 @@ def main() -> None:
         api_hash = args.api_hash or connector_cfg.api_hash
         phone = args.phone or connector_cfg.phone
 
+    # Log connector details (mask api_hash for security)
     if _debug_secrets_enabled():
-        logger.info(f"Resolved api_id={api_id} api_hash={api_hash} phone={phone}")
+        masked_hash = f"***{api_hash[-4:]}" if api_hash and len(api_hash) > 4 else "***"
+        logger.info(f"Resolved api_id={api_id} api_hash={masked_hash} phone={phone}")
     else:
         logger.info(f"Resolved api_id={api_id} phone={phone}")
 
