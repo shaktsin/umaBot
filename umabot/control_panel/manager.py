@@ -80,7 +80,7 @@ class ControlPanelManager:
                 text=message,
                 connector=self.config.connector,
             )
-            logger.debug(f"Sent notification to control panel: {message[:50]}...")
+            logger.debug("Sent notification to control panel")
         except Exception as exc:
             logger.error(f"Failed to send control panel notification: {exc}")
 

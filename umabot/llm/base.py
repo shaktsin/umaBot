@@ -45,5 +45,5 @@ class LLMClient:
                 body = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 body = ""
-            logger.error("LLM HTTP error status=%s body=%s", exc.code, body)
+            logger.error("LLM HTTP error status=%s body_len=%s", exc.code, len(body))
             raise

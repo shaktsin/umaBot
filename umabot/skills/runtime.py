@@ -86,24 +86,32 @@ class SkillRuntime:
             logger.warning("Skill runtime blocked unsafe script path skill=%s path=%s", skill_name, script_path)
             return SkillRunResult(ok=False, output="Unsafe script path")
 
-        python_exe = self._skill_python(skill.path)
-        if not python_exe.exists():
-            logger.debug("Skill runtime missing venv python skill=%s python=%s", skill_name, python_exe)
-            return SkillRunResult(ok=False, output=f"Skill runtime is not prepared for '{skill_name}'. Reinstall skill.")
+        # Detect script type and build command
+        script_type = self._detect_script_type(script_path)
+        cmd = self._build_script_command(skill.path, script_path, script_type)
+        if not cmd:
+            logger.debug("Skill runtime cannot execute script skill=%s type=%s", skill_name, script_type)
+            return SkillRunResult(ok=False, output=f"Unsupported script type: {script_type}")
 
         runtime_cfg = skill.metadata.runtime or {}
         timeout = int(runtime_cfg.get("timeout_seconds", 20))
         env = self._build_env(skill_name)
+        config_args = self.config.skill_configs.get(skill_name, {}).get("args", {})
+        if not isinstance(config_args, dict):
+            config_args = {}
+
+        # For bash scripts, pass payload as JSON via stdin
+        # For Python scripts, pass payload as JSON via stdin
         stdin_data = json.dumps(
             {
                 "input": payload,
-                "config": self.config.skill_configs.get(skill_name, {}).get("args", {}),
+                "config": config_args,
             }
         ).encode("utf-8")
 
         proc = await asyncio.to_thread(
             self._spawn_process,
-            [str(python_exe), str(script_path)],
+            cmd,
             str(skill.path),
             env,
         )
@@ -173,6 +181,15 @@ class SkillRuntime:
             "LC_ALL": "C.UTF-8",
             "PATH": os.environ.get("PATH", ""),
         }
+        # Resolve env vars declared in the skill manifest.
+        # Priority: config.yaml value > host environment variable
+        skill = self.skill_registry.get(skill_name)
+        if skill:
+            declared_env = (skill.metadata.install_config or {}).get("env", {})
+            for key in declared_env:
+                key_str = str(key)
+                if key_str not in env_cfg and key_str in os.environ:
+                    env[key_str] = os.environ[key_str]
         for key, value in env_cfg.items():
             env[str(key)] = str(value)
         return env
@@ -181,6 +198,54 @@ class SkillRuntime:
         if sys.platform == "win32":
             return skill_path / ".venv" / "Scripts" / "python.exe"
         return skill_path / ".venv" / "bin" / "python"
+
+    def _detect_script_type(self, script_path: Path) -> str:
+        """Detect script type from extension or shebang."""
+        ext = script_path.suffix.lower()
+
+        if ext == ".py":
+            return "python"
+        elif ext in {".sh", ".bash"}:
+            return "bash"
+
+        # Try to detect from shebang
+        try:
+            with open(script_path, "r", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+                if first_line.startswith("#!"):
+                    if "python" in first_line:
+                        return "python"
+                    elif "bash" in first_line or "sh" in first_line:
+                        return "bash"
+        except Exception:
+            pass
+
+        # Default to python for backward compatibility
+        return "python"
+
+    def _build_script_command(self, skill_path: Path, script_path: Path, script_type: str) -> list[str]:
+        """Build command to execute script based on type."""
+        if script_type == "python":
+            python_exe = self._skill_python(skill_path)
+            if not python_exe.exists():
+                logger.debug("Missing venv python at %s", python_exe)
+                return []
+            return [str(python_exe), str(script_path)]
+
+        elif script_type == "bash":
+            # Use system bash
+            bash_exe = "bash"
+            if sys.platform == "win32":
+                # On Windows, try to find bash (Git Bash, WSL, etc.)
+                import shutil as sh
+                bash_path = sh.which("bash")
+                if not bash_path:
+                    logger.warning("Bash not found on Windows")
+                    return []
+                bash_exe = bash_path
+            return [bash_exe, str(script_path)]
+
+        return []
 
     def _spawn_process(self, cmd: list[str], cwd: str, env: Dict[str, str]) -> subprocess.Popen:
         preexec = _preexec_limits if os.name != "nt" else None

@@ -1,0 +1,4 @@
+# Python dependencies for this skill
+# These will be installed in the skill's isolated virtualenv
+
+requests>=2.31.0

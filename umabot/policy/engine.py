@@ -74,7 +74,7 @@ class PolicyEngine:
         tool_call: Dict[str, Any],
         messages: list[dict],
     ) -> str:
-        token = secrets.token_hex(3)
+        token = secrets.token_hex(8)  # 128 bits of entropy (16 hex chars)
         pending = PendingConfirmation(
             token=token,
             chat_id=chat_id,

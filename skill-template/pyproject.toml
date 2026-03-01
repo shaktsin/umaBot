@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "umabot-skill-example"
+version = "1.0.0"
+description = "Example skill for UmaBot"
+readme = "README.md"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/umabot-skill-example"
+Repository = "https://github.com/yourusername/umabot-skill-example.git"
+Issues = "https://github.com/yourusername/umabot-skill-example/issues"
+
+[tool.setuptools]
+packages = []  # No Python packages, just skill files
+
+[tool.setuptools.package-data]
+"*" = ["SKILL.md", "scripts/*", "requirements.txt"]

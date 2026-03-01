@@ -123,28 +123,35 @@ def run_wizard(
         ).ask()
 
         if ui_type == "telegram":
-            telegram_token = _prompt_required_secret(
-                "Enter Telegram bot token for control panel:"
+            console.print("\n[cyan]━━━ Telegram Control Panel Setup ━━━[/cyan]\n")
+            console.print(
+                "We'll automatically discover your chat ID by having you send a message to your bot.\n"
             )
 
-            chat_id = questionary.text(
-                "Enter your Telegram chat ID (send /start to bot to find it):"
-            ).ask()
+            # Use automatic setup from control_panel_setup
+            from umabot.cli.control_panel_setup import _get_bot_token_and_discover_chat_id
 
-            cfg.control_panel.enabled = True
-            cfg.control_panel.ui_type = "telegram"
-            cfg.control_panel.connector = "control_panel_bot"
-            cfg.control_panel.chat_id = chat_id
+            result = asyncio.run(_get_bot_token_and_discover_chat_id())
 
-            # Add control panel connector
-            cfg.connectors.append(
-                ConnectorConfig(
-                    name="control_panel_bot",
-                    type="telegram_bot",
-                    token=telegram_token
+            if result:
+                telegram_token, chat_id, bot_username = result
+
+                cfg.control_panel.enabled = True
+                cfg.control_panel.ui_type = "telegram"
+                cfg.control_panel.connector = "control_panel_bot"
+                cfg.control_panel.chat_id = chat_id
+
+                # Add control panel connector
+                cfg.connectors.append(
+                    ConnectorConfig(
+                        name="control_panel_bot",
+                        type="telegram_bot",
+                        token=telegram_token
+                    )
                 )
-            )
-            console.print("[green]✓ Control panel configured via Telegram[/green]")
+                console.print(f"[green]✓ Control panel configured via Telegram (@{bot_username})[/green]")
+            else:
+                console.print("[yellow]Control panel setup skipped[/yellow]")
 
         elif ui_type == "discord":
             discord_token = _prompt_required_secret(

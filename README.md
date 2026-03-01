@@ -9,32 +9,419 @@ Self-hosted personal AI assistant that runs as a long-running daemon and is cont
 - Skills with `SKILL.md` frontmatter and strict tool allowlists.
 - Tool risk tiers with explicit confirmation for RED actions.
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            USER INTERFACES                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  👤 Owner          👥 External Users                                        │
+│  (Control Panel)   (Telegram/Discord/WhatsApp)                             │
+│        │                    │                                               │
+│        └────────┬───────────┘                                               │
+│                 │                                                           │
+└─────────────────┼───────────────────────────────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      CONNECTOR LAYER (Out-of-Process)                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
+│  │ Control  │  │ Telegram │  │ Telegram │  │ Discord  │                   │
+│  │  Panel   │  │   Bot    │  │   User   │  │   Bot    │                   │
+│  │Connector │  │Connector │  │Connector │  │Connector │                   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘                   │
+│       │             │               │             │                         │
+│       └─────────────┴───────────────┴─────────────┘                         │
+│                          │                                                  │
+│                          ▼                                                  │
+│                   ┌─────────────┐                                           │
+│                   │ WebSocket   │                                           │
+│                   │ Hub :8765   │ (Routes msgs between connectors/gateway) │
+│                   └──────┬──────┘                                           │
+│                          │                                                  │
+└──────────────────────────┼──────────────────────────────────────────────────┘
+                           │ WebSocket (ws://)
+                           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          GATEWAY PROCESS                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌────────────────┐         ┌──────────────┐        ┌─────────────────┐   │
+│  │   WebSocket    │────────▶│   Message    │───────▶│  Control Panel  │   │
+│  │    Gateway     │         │    Router    │        │     Manager     │   │
+│  └────────────────┘         └──────┬───────┘        └────────┬────────┘   │
+│                                    │                         │             │
+│                          ┌─────────┴─────────┐              │             │
+│                          │                   │              │             │
+│                          ▼                   ▼              │             │
+│                  Control Messages    External Messages      │             │
+│                          │                   │              │             │
+│                          │                   ▼              │             │
+│                          │            ┌─────────────┐       │             │
+│                          │            │   Message   │       │             │
+│                          │            │    Queue    │       │             │
+│                          │            │  (SQLite)   │       │             │
+│                          │            └──────┬──────┘       │             │
+│                          │                   │              │             │
+└──────────────────────────┼───────────────────┼──────────────┼─────────────┘
+                           │                   │              │
+                           │                   ▼              │
+                           │       ┌────────────────────┐     │
+                           │       │  WORKER PROCESS    │     │
+                           │       ├────────────────────┤     │
+                           │       │                    │     │
+                           │       │  ┌──────────────┐  │     │
+                           │       │  │    Worker    │  │     │
+                           │       │  │  Event Loop  │◀─┼─────┘ (RED tool confirm)
+                           │       │  └──────┬───────┘  │
+                           │       │         │          │
+                           │       │         ▼          │
+                           │       │  ┌──────────────┐  │
+                           │       │  │  LLM Client  │  │
+                           │       │  │ OpenAI/Claude│  │
+                           │       │  │   /Gemini    │  │
+                           │       │  └──────┬───────┘  │
+                           │       │         │          │
+                           │       │         ▼          │
+                           │       │  ┌──────────────┐  │
+                           │       │  │Policy Engine │  │
+                           │       │  │ Risk: 🟢🟡🔴 │  │
+                           │       │  └──────┬───────┘  │
+                           │       │         │          │
+                           │       │         ▼          │
+                           │       │  ┌──────────────┐  │
+                           │       │  │  Unified     │  │
+                           │       │  │    Tool      │  │
+                           │       │  │  Registry    │  │
+                           │       │  └──────┬───────┘  │
+                           │       │         │          │
+                           │       └─────────┼──────────┘
+                           │                 │
+                           │                 ▼
+                           │    ┌────────────┴────────────┐
+                           │    │                         │
+                           │    ▼                         ▼
+┌──────────────────────────┼────────────┐    ┌────────────────────┐
+│       TOOL SYSTEM        │            │    │   TASK SCHEDULER   │
+├──────────────────────────┴────────────┤    ├────────────────────┤
+│                                       │    │                    │
+│  ┌──────────┐  ┌──────────┐  ┌──────┐│    │  ┌──────────────┐  │
+│  │ Built-in │  │ Skills   │  │ MCP  ││    │  │   Cron +     │  │
+│  │  Tools   │  │ Python/  │  │JSON- ││    │  │  One-time    │  │
+│  │  🟢      │  │ Bash     │  │ RPC  ││    │  │    Tasks     │  │
+│  │shell.run │  │  🟡      │  │  🔵  ││    │  └──────┬───────┘  │
+│  └──────────┘  └────┬─────┘  └──────┘│    │         │          │
+│                     │                 │    └─────────┼──────────┘
+│                     ▼                 │              │
+│              ┌─────────────┐          │              │
+│              │ Subprocess  │          │              │
+│              │  .venv      │          │              │
+│              │ isolation   │          │              │
+│              └─────────────┘          │              │
+└────────────────────────────────────────┘              │
+                                                        │
+                    ┌───────────────────────────────────┘
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           STORAGE LAYER                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────────┐  ┌────────────────┐  ┌──────────────────────────┐   │
+│  │   SQLite DB      │  │  Vault Dir     │  │    Skills Directory      │   │
+│  │                  │  │                │  │                          │   │
+│  │ • messages       │  │ • file storage │  │ • ~/.umabot/skills/      │   │
+│  │ • sessions       │  │ • sensitive    │  │ • ./skills/              │   │
+│  │ • tasks          │  │   data         │  │                          │   │
+│  │ • task_runs      │  │                │  │ Each skill has:          │   │
+│  │ • audit_log      │  │                │  │  - SKILL.md (manifest)   │   │
+│  │                  │  │                │  │  - .venv (isolated deps) │   │
+│  │                  │  │                │  │  - scripts/ (Python/Bash)│   │
+│  └──────────────────┘  └────────────────┘  └──────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+
+| Component | Purpose | Process |
+|-----------|---------|---------|
+| **Control Panel** | Owner's private UI for confirmations | Separate connector |
+| **Connectors** | Message sources (Telegram, Discord, etc.) | Out-of-process workers |
+| **WebSocket Hub** | Routes messages between connectors and gateway | Gateway subprocess |
+| **Message Router** | Classifies control vs external messages | Gateway main |
+| **Worker** | Processes messages with LLM + tools | Async event loop |
+| **Unified Tool Registry** | Manages built-in tools, skills, and MCP | Worker component |
+| **Policy Engine** | Risk assessment and confirmation flow | Worker component |
+| **Task Scheduler** | Executes periodic and one-time tasks | Separate event loop |
+| **SQLite DB** | Persistent storage for messages, tasks, audit | Shared across components |
+
+### Message Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      MESSAGE PROCESSING FLOW                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  User sends message
+         │
+         ├──▶ [1] Connector receives (Telegram/Discord/WhatsApp)
+         │
+         ├──▶ [2] WebSocket connection → Gateway
+         │
+         ├──▶ [3] Message Router classifies:
+         │         ├─ Control message? → Control Panel Manager
+         │         └─ External message? → Message Queue
+         │
+         ├──▶ [4] Queue persists to SQLite
+         │
+         ├──▶ [5] Worker claims job from queue
+         │
+         ├──▶ [6] Worker builds context (refresh skills, load history)
+         │
+         ├──▶ [7] LLM processes message + available tools
+         │         │
+         │         ├─ LLM decides: needs tool call?
+         │         │         │
+         │         │         ├─ YES → [8] Policy Engine checks risk
+         │         │         │            │
+         │         │         │            ├─ 🟢 GREEN: Auto-approve
+         │         │         │            ├─ 🟡 YELLOW: Auto-approve
+         │         │         │            └─ 🔴 RED: Request confirmation
+         │         │         │                     │
+         │         │         │                     └──▶ Control Panel
+         │         │         │                           Owner approves/denies
+         │         │         │
+         │         │         └─ [9] Execute tool:
+         │         │                 ├─ Built-in: Run in-process
+         │         │                 ├─ Skill: Spawn subprocess (venv)
+         │         │                 └─ MCP: Call external API
+         │         │
+         │         └─ [10] LLM generates final response with tool results
+         │
+         ├──▶ [11] Response sent to WebSocket Hub
+         │
+         ├──▶ [12] Hub routes to original connector
+         │
+         └──▶ [13] User receives reply
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Example: User asks "What files are in my home directory?"              │
+│                                                                          │
+│  1. Telegram connector receives message                                 │
+│  2. Gateway routes as external message                                  │
+│  3. Worker claims, sends to LLM with tool list                          │
+│  4. LLM decides to call: shell.run("ls ~")                              │
+│  5. Policy checks: shell.run is 🔴 RED                                  │
+│  6. Control Panel asks owner: "Confirm shell.run: ls ~?"                │
+│  7. Owner replies: "YES token123"                                       │
+│  8. Tool executes: subprocess runs "ls ~"                               │
+│  9. LLM formats result: "Your home directory contains: ..."             │
+│  10. Response sent back to user via Telegram                            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Tool Execution Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      TOOL ROUTING & EXECUTION                           │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  LLM decides to call tool: "tool_name"
+         │
+         ▼
+  UnifiedToolRegistry.execute_tool(name, args)
+         │
+         │ (Route based on tool name prefix)
+         │
+         ├─────────────┬─────────────┬─────────────┐
+         │             │             │             │
+         ▼             ▼             ▼             ▼
+  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+  │ Built-in │  │  Skill   │  │  Skill   │  │   MCP    │
+  │  Tools   │  │ (Python) │  │  (Bash)  │  │  Server  │
+  │   🟢     │  │   🟡     │  │   🟡     │  │   🔵     │
+  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
+       │             │              │              │
+       │             │              │              │
+  ┌────▼─────────────▼──────────────▼──────────────▼────┐
+  │                                                      │
+  │  shell.run      skill_github_   skill_backup_      mcp_filesystem_
+  │                 create_pr       run                 read_file
+  │                                                      │
+  └──────┬───────────┬──────────────┬───────────────────┬┘
+         │           │              │                   │
+         ▼           ▼              ▼                   ▼
+  ┌──────────┐  ┌─────────┐  ┌──────────┐  ┌──────────────────┐
+  │ Execute  │  │ Spawn   │  │ Spawn    │  │ HTTP/JSON-RPC    │
+  │in-process│  │ python  │  │ bash     │  │ to external      │
+  │          │  │ venv/   │  │ script   │  │ MCP server       │
+  │async fn()│  │ bin/    │  │          │  │                  │
+  │          │  │ python  │  │ + stdin  │  │ {"method": ...}  │
+  │          │  │ script  │  │   JSON   │  │                  │
+  └──────────┘  └─────────┘  └──────────┘  └──────────────────┘
+       │             │              │                   │
+       └─────────────┴──────────────┴───────────────────┘
+                              │
+                              ▼
+                       ToolResult
+                    (content, data)
+                              │
+                              ▼
+                      Back to Worker
+                              │
+                              ▼
+                      Sent to LLM for
+                      final response
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Tool Examples:                                                          │
+│                                                                          │
+│  shell.run            → Built-in tool (subprocess.run)                  │
+│  skill_github_pr      → Skill tool (Python script in venv)              │
+│  skill_backup_run     → Skill tool (Bash script)                        │
+│  mcp_fs_read_file     → MCP tool (external filesystem server)           │
+│                                                                          │
+│  Tool Naming Convention:                                                │
+│  • Built-in: <category>.<action>         (e.g., shell.run)              │
+│  • Skills:   skill_<name>_<script>       (e.g., skill_github_create_pr) │
+│  • MCP:      mcp_<server>_<tool>         (e.g., mcp_github_create_issue)│
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Security Layers
+
+| Layer | Protection |
+|-------|-----------|
+| **Input Validation** | JSON Schema for all tool calls |
+| **Risk Assessment** | 🟢 GREEN (safe) / 🟡 YELLOW (caution) / 🔴 RED (confirm) |
+| **Isolation** | Skills run in separate virtualenv subprocesses |
+| **Confirmation** | RED tools require owner approval via control panel |
+| **Resource Limits** | CPU/memory/timeout limits on skill execution |
+
+## Control Panel Setup
+
+The control panel is your **private interface** for:
+- Receiving confirmations for 🔴 RED tools (like shell.run)
+- Getting task execution results
+- System notifications
+
+### Automatic Setup (Recommended)
+
+```bash
+umabot control-panel setup
+```
+
+**What it does:**
+1. Asks for your Telegram bot token (from @BotFather)
+2. Verifies the bot works
+3. **Automatically captures your chat ID** when you send a message
+4. Saves everything to config.yaml
+5. Sends confirmation to your Telegram
+
+**Step-by-step:**
+```
+$ umabot control-panel setup
+
+┌─────────────────────────────────────────────┐
+│  Telegram Control Panel Setup              │
+└─────────────────────────────────────────────┘
+
+Step 1: Telegram Bot Token
+👉 Open Telegram and message @BotFather
+👉 Send: /newbot
+👉 Follow instructions and copy the token
+
+Enter your bot token: 1234567890:ABC...
+
+✓ Bot verified: @my_uma_bot
+
+Step 2: Send a message to your bot
+👉 Open Telegram and search for: @my_uma_bot
+👉 Send any message (like /start) to the bot
+
+⠋ Waiting for your message...
+
+✓ Received message from: John
+✓ Chat ID: 123456789
+✓ Sent confirmation to your Telegram
+
+Step 3: Saving configuration...
+✓ Configuration saved to: config.yaml
+
+┌─────────────────────────────────────────────┐
+│  ✓ Setup Complete!                          │
+│                                             │
+│  Your control panel is ready:               │
+│    • Bot: @my_uma_bot                       │
+│    • Chat ID: 123456789                     │
+│    • Connector: control_panel_bot           │
+│                                             │
+│  Next steps:                                │
+│    1. Start UmaBot: umabot start            │
+│    2. The bot will use this chat for        │
+│       confirmations                         │
+│    3. Test it by triggering a 🔴 RED tool   │
+└─────────────────────────────────────────────┘
+```
+
+### Manual Setup (Alternative)
+
+If you prefer to configure manually:
+
+```yaml
+control_panel:
+  enabled: true
+  ui_type: telegram
+  connector: control_panel_bot
+  chat_id: "123456789"  # Your Telegram chat ID
+
+connectors:
+  - name: control_panel_bot
+    type: telegram_bot
+    token: "1234567890:ABC..."  # Your bot token
+```
+
+**Finding your chat ID manually:**
+1. Message @userinfobot on Telegram
+2. It will reply with your chat ID
+3. Copy the ID to config.yaml
+
 ## Quick Start
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
-umabot init
-umabot start
-umabot status
+umabot init                    # Configure UmaBot
+umabot control-panel setup     # Set up Telegram control panel (automatic chat ID)
+umabot start                   # Start daemon
+umabot status                  # Check status
 ```
 
 ## CLI
 ```bash
-umabot init
-umabot start
-umabot stop
-umabot status
-umabot reload
-umabot skills list
-umabot skills install <path>
-umabot skills configure <name>
-umabot skills remove <name>
-umabot skills lint
+# Setup and daemon management
+umabot init                              # Interactive configuration wizard
+umabot control-panel setup               # Set up Telegram control panel (auto chat ID)
+umabot start                             # Start daemon
+umabot stop                              # Stop daemon
+umabot status                            # Show daemon status
+umabot reload                            # Reload configuration
+
+# Skill management
+umabot skills list                       # List installed skills
+umabot skills install <source>           # Install from PyPI/GitHub/local
+umabot skills remove <name>              # Remove skill
+umabot skills lint                       # Validate skills
+
+# Task scheduling
 umabot tasks create --name "Daily Todos" --prompt "Summarize my todos" --type periodic --frequency daily --time 09:00 --timezone UTC
-umabot tasks list
-umabot tasks cancel 1
+umabot tasks list                        # List all tasks
+umabot tasks cancel 1                    # Cancel task by ID
 ```
 
 ## Configuration
@@ -170,9 +557,56 @@ Rules:
 ## Tool Security
 - JSON schema validation for all tool calls.
 - Risk tiers: `GREEN`, `YELLOW`, `RED`.
-- `RED` requires confirmation: `Reply YES <token> to confirm`.
+- `RED` requires confirmation: `Reply YES <16-char-token> to confirm` (128-bit entropy).
 - Shell tool is disabled by default.
- - Confirmations can be routed to a control channel via `runtime.control_channel` and `runtime.control_chat_id`.
+- Confirmations can be routed to a control channel via `runtime.control_channel` and `runtime.control_chat_id`.
+
+## Security Best Practices
+
+### Secret Management
+**⚠️ IMPORTANT: Never commit secrets to git!**
+
+UmaBot supports multiple ways to store secrets securely:
+
+1. **Environment Variables (Recommended for Production)**
+   ```bash
+   # For LLM API key
+   export UMABOT_LLM_API_KEY="your-api-key"
+
+   # For connector tokens (replace CONNECTOR_NAME with your connector name)
+   export UMABOT_CONNECTOR_CONTROL_PANEL_BOT_TOKEN="your-telegram-token"
+   export UMABOT_CONNECTOR_PUBLIC_TELEGRAM_TOKEN="your-other-token"
+   ```
+
+2. **macOS Keychain (Automatic on macOS)**
+   - Secrets are automatically stored in macOS Keychain during `umabot init`
+   - Retrieved securely when UmaBot starts
+   - Never stored in plaintext config files
+
+3. **~/.umabot/.env File (Fallback on Linux)**
+   - Used when Keychain is unavailable
+   - File permissions automatically set to `0600` (user-only)
+   - Directory permissions set to `0700` (user-only access)
+
+### Config File Security
+- `config.yaml` is automatically excluded from git (see `.gitignore`)
+- API keys and tokens are **stripped** before saving to config
+- Tokens must be provided via environment variables or keychain
+- Session files (`.session`) are also git-ignored
+
+### Logging Security
+- Secrets are never logged in plaintext
+- Tokens are masked: `***<last-4-chars>` in debug logs
+- Confirmation tokens are hashed before logging (SHA256, 8-char prefix)
+
+### Production Deployment Checklist
+- [ ] Use environment variables for all secrets
+- [ ] Set restrictive file permissions on config directory (`chmod 700 ~/.umabot`)
+- [ ] Enable shell tool only if absolutely necessary
+- [ ] Review allowed tools in skill configurations
+- [ ] Use separate control panel bot token (not your personal account)
+- [ ] Regularly rotate API keys and tokens
+- [ ] Monitor logs for unauthorized access attempts
 
 ## Message Router
 UMA BOT distinguishes between:
