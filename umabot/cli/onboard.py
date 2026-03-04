@@ -108,6 +108,9 @@ def run_wizard(
         "This is separate from message connectors (which handle external messages)."
     )
 
+    telegram_token = ""
+    discord_token = ""
+
     setup_control = questionary.confirm("Set up control panel now?", default=True).ask()
 
     if setup_control:
@@ -214,7 +217,7 @@ def run_wizard(
 
     # Save configuration
     save_cfg(cfg, str(config_file))
-    store_secrets(api_key=api_key)
+    store_secrets(api_key=api_key, telegram_token=telegram_token, discord_token=discord_token)
 
     console.print(
         Panel.fit(
