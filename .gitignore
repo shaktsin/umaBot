@@ -214,7 +214,7 @@ wa_session/
 *.db-*
 *.pid
 config.example.yaml.bak
-skills/
+/skills/
 
 plans/
 docs/
