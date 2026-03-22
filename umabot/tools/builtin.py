@@ -22,7 +22,12 @@ def set_active_skill_env(env: Optional[Dict[str, str]]) -> None:
     _active_skill_env.set(env)
 
 
-def register_builtin_tools(registry: ToolRegistry, *, enable_shell: bool) -> None:
+def register_builtin_tools(
+    registry: ToolRegistry,
+    *,
+    enable_shell: bool,
+    skill_registry=None,
+) -> None:
     if enable_shell:
         registry.register(
             Tool(
@@ -40,6 +45,57 @@ def register_builtin_tools(registry: ToolRegistry, *, enable_shell: bool) -> Non
                 description="Run a shell command.",
             )
         )
+
+    # Stage-3 progressive disclosure: LLM calls this when it needs the full
+    # SKILL.md body (not just the summary injected at stage 2).
+    if skill_registry is not None:
+        registry.register(
+            Tool(
+                name="skill.get_instructions",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "skill_name": {
+                            "type": "string",
+                            "description": "Name of the skill to retrieve full instructions for.",
+                        },
+                    },
+                    "required": ["skill_name"],
+                    "additionalProperties": False,
+                },
+                handler=_make_skill_instructions_handler(skill_registry),
+                description=(
+                    "Retrieve the full instructions for a skill by name. "
+                    "Use this when the skill summary in your context is not enough "
+                    "to complete the task."
+                ),
+            )
+        )
+
+
+def _make_skill_instructions_handler(skill_registry):
+    async def _skill_get_instructions(args: Dict[str, Any]) -> ToolResult:
+        name = args.get("skill_name", "").strip()
+        if not name:
+            return ToolResult(content="skill_name is required.")
+        skill = skill_registry.get(name)
+        if not skill:
+            available = ", ".join(s.metadata.name for s in skill_registry.list())
+            return ToolResult(
+                content=f"Skill '{name}' not found. Available skills: {available}"
+            )
+        body = skill.metadata.body or ""
+        if not body:
+            return ToolResult(content=f"Skill '{name}' has no instructions.")
+        return ToolResult(
+            content=(
+                f"Full instructions for skill '{name}':\n"
+                f"Skill directory: {skill.path}\n\n"
+                f"{body}"
+            )
+        )
+
+    return _skill_get_instructions
 
 
 async def _shell_run(args: Dict[str, Any]) -> ToolResult:

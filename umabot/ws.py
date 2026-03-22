@@ -48,6 +48,23 @@ class ChannelHub:
             await client.ws.send_json({"type": "send", "chat_id": chat_id, "text": text})
             return True
 
+    async def send_payload(self, channel: str, connector: str, chat_id: str, payload: dict) -> bool:
+        """Send an arbitrary JSON payload to a specific connector.
+
+        Used for structured messages like confirmation requests that carry
+        more than just text (e.g. action buttons for Telegram inline keyboard).
+        ``payload`` must include a ``"type"`` field.
+        """
+        async with self._lock:
+            bucket = self._clients.get(channel)
+            if not bucket:
+                return False
+            client = next((c for c in bucket.values() if c.connector == connector), None)
+            if not client:
+                return False
+            await client.ws.send_json({**payload, "chat_id": chat_id})
+            return True
+
     async def has_channel(self, channel: str) -> bool:
         async with self._lock:
             return channel in self._clients and bool(self._clients[channel])

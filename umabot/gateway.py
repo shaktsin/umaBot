@@ -76,6 +76,7 @@ class Gateway:
             unified_registry=unified_registry,
             send_message=self.send_message,
             send_control_message=self.send_control_message,
+            send_confirmation_request=self.send_confirmation_request,
         )
         self._scheduler = TaskScheduler(db=db, queue=queue)
 
@@ -127,6 +128,7 @@ class Gateway:
             unified_registry=unified_registry,
             send_message=self.send_message,
             send_control_message=self.send_control_message,
+            send_confirmation_request=self.send_confirmation_request,
         )
         await self._worker.start()
         await self._scheduler.start()
@@ -135,6 +137,39 @@ class Gateway:
     async def send_message(self, channel: str, chat_id: str, text: str, connector: str = "") -> None:
         if not await self._hub.send(channel, connector, chat_id, text):
             logger.warning("No connector available for channel=%s connector=%s", channel, connector)
+
+    async def send_confirmation_request(
+        self,
+        channel: str,
+        chat_id: str,
+        connector: str,
+        tool_name: str,
+        args_preview: str,
+        token: str,
+    ) -> None:
+        """Send a structured tool-approval request to the connector.
+
+        Connectors that support interactive buttons (e.g. Telegram bot) will
+        render Approve/Deny buttons.  Others fall back to plain text.
+        """
+        sent = await self._hub.send_payload(
+            channel,
+            connector,
+            chat_id,
+            {
+                "type": "confirm_request",
+                "tool_name": tool_name,
+                "args_preview": args_preview,
+                "token": token,
+            },
+        )
+        if not sent:
+            # Fallback: plain text (no token exposed — plain YES uses most-recent pending)
+            await self.send_control_message(
+                channel,
+                chat_id,
+                f"⚠️ Approval required: `{tool_name}`\n\nReply YES to approve or NO to deny.",
+            )
 
     async def send_control_message(self, fallback_channel: str, fallback_chat_id: str, text: str) -> None:
         """Send message to control panel, with fallback to original channel."""
@@ -314,6 +349,7 @@ def build_runtime(config_path: Optional[str] = None, overrides: Optional[Dict[st
     register_builtin_tools(
         tool_registry,
         enable_shell=config.tools.shell_enabled,
+        skill_registry=skill_registry,
     )
 
     unified_registry = UnifiedToolRegistry()
@@ -335,6 +371,7 @@ def _reload_runtime(config_path: str, overrides: Optional[Dict[str, str]] = None
     register_builtin_tools(
         tool_registry,
         enable_shell=config.tools.shell_enabled,
+        skill_registry=skill_registry,
     )
 
     unified_registry = UnifiedToolRegistry()

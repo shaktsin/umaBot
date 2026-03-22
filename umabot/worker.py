@@ -34,6 +34,7 @@ class Worker:
         unified_registry: UnifiedToolRegistry,
         send_message,
         send_control_message,
+        send_confirmation_request=None,
     ) -> None:
         self.config = config
         self.db = db
@@ -44,6 +45,7 @@ class Worker:
         self.unified_registry = unified_registry
         self.send_message = send_message
         self.send_control_message = send_control_message
+        self.send_confirmation_request = send_confirmation_request
         self._stop = asyncio.Event()
         self._tasks: List[asyncio.Task] = []
         self._chat_locks: Dict[str, asyncio.Lock] = {}
@@ -257,15 +259,22 @@ class Worker:
                     messages=messages,
                 )
                 if decision.require_confirmation:
-                    token_hash = hashlib.sha256(decision.token.encode()).hexdigest()[:8]
-                    logger.info("Tool confirmation required name=%s token_hash=%s", tool_call.name, token_hash)
+                    logger.info("Tool confirmation required name=%s", tool_call.name)
                     args_preview = json.dumps(tool_call.arguments, indent=2)[:400] if tool_call.arguments else ""
-                    prompt = (
-                        f"Tool confirmation required: `{tool_call.name}`\n"
-                        f"Arguments:\n{args_preview}\n\n"
-                        f"Reply YES {decision.token} to approve or NO {decision.token} to deny."
-                    )
-                    await self.send_control_message(channel, chat_id, prompt)
+                    if self.send_confirmation_request:
+                        # Connector-native buttons (e.g. Telegram inline keyboard)
+                        await self.send_confirmation_request(
+                            channel, chat_id, connector,
+                            tool_call.name, args_preview, decision.token,
+                        )
+                    else:
+                        # Plain-text fallback — plain YES works via most-recent pending
+                        prompt = (
+                            f"⚠️ Approval required: `{tool_call.name}`\n"
+                            f"Arguments:\n{args_preview}\n\n"
+                            f"Reply YES to approve or NO to deny."
+                        )
+                        await self.send_control_message(channel, chat_id, prompt)
                     self.db.add_audit(
                         "tool_confirmation_requested",
                         {"chat_id": chat_id, "tool": tool_call.name, "token": decision.token},
@@ -698,15 +707,56 @@ def _context_fingerprint(skill_registry: SkillRegistry, tool_registry: ToolRegis
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+_SKILL_SUMMARY_CHARS = 1500  # stage-2 preview cap
+
+
+def _skill_summary(body: str, skill_name: str) -> str:
+    """Return a condensed stage-2 summary of a SKILL.md body.
+
+    Includes content up to the second '## ' section header (typically the
+    overview + trigger/quick-start) capped at _SKILL_SUMMARY_CHARS.  The LLM
+    is told it can call skill.get_instructions() for the full body.
+    """
+    hint = (
+        f"\n\n[Summary only — call skill.get_instructions(skill_name='{skill_name}') "
+        f"if you need the full instructions.]"
+    )
+    if len(body) <= _SKILL_SUMMARY_CHARS:
+        return body  # short enough — no truncation needed
+
+    # Find the second '## ' heading and cut there
+    second_header_pos = -1
+    headers_seen = 0
+    for i, line_start in enumerate(_line_starts(body)):
+        if body[line_start:line_start + 3] == "## ":
+            headers_seen += 1
+            if headers_seen == 2:
+                second_header_pos = line_start
+                break
+
+    if 0 < second_header_pos <= _SKILL_SUMMARY_CHARS:
+        return body[:second_header_pos].rstrip() + hint
+
+    return body[:_SKILL_SUMMARY_CHARS].rstrip() + hint
+
+
+def _line_starts(text: str):
+    """Yield the character index of the start of each line."""
+    yield 0
+    for i, ch in enumerate(text):
+        if ch == "\n" and i + 1 < len(text):
+            yield i + 1
+
+
 def _build_skill_system_messages(
     skill_registry: SkillRegistry,
     user_text: Optional[str] = None,
 ) -> List[Dict[str, str]]:
-    """Build system messages for skill context.
+    """Build system messages for skill context using progressive disclosure.
 
-    1. Always includes a skill catalog (all skill names + descriptions).
-    2. If user_text is provided and matches a skill, injects the full
-       SKILL.md body as active skill instructions.
+    Stage 1 — catalog (always): all skill names + one-line descriptions.
+    Stage 2 — summary (on trigger match): condensed SKILL.md overview.
+    Stage 3 — full body (on demand): LLM calls skill.get_instructions() tool.
     """
     skills = skill_registry.list()
     if not skills:
@@ -716,24 +766,28 @@ def _build_skill_system_messages(
     logger.debug("Skill catalog: %d skills loaded", len(skills))
     messages: List[Dict[str, str]] = []
 
-    # Skill catalog — always present
+    # Stage 1 — skill catalog, always present
     catalog_lines = [
         "Available skills (activate by matching user intent):",
     ]
     for skill in sorted(skills, key=lambda s: s.metadata.name):
         catalog_lines.append(f"- {skill.metadata.name}: {skill.metadata.description}")
+    catalog_lines.append(
+        "\nTo get the full instructions for any skill, call skill.get_instructions(skill_name=...)."
+    )
     messages.append({"role": "system", "content": "\n".join(catalog_lines)})
 
-    # Active skill — inject full instructions when matched
+    # Stage 2 — condensed summary injected when user intent matches a skill
     if user_text:
         matched = skill_registry.match_trigger(user_text)
         if matched and matched.metadata.body:
             logger.debug("Skill matched: %s for text: %.80s", matched.metadata.name, user_text)
+            summary = _skill_summary(matched.metadata.body, matched.metadata.name)
             instructions = (
                 f"ACTIVE SKILL: {matched.metadata.name}\n"
                 f"Skill directory: {matched.path}\n"
                 f"Follow these instructions to complete the task:\n\n"
-                f"{matched.metadata.body}"
+                f"{summary}"
             )
             messages.append({"role": "system", "content": instructions})
         else:
