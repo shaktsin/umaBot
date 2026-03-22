@@ -6,13 +6,16 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from umabot.agents import DynamicOrchestrator
 from umabot.llm import ClaudeClient, GeminiClient, OpenAIClient
+from umabot.llm.rate_limiter import TokenBucket
 from umabot.policy import PolicyEngine
 from umabot.skills import SkillRegistry
 from umabot.storage import Database, Queue
 from umabot.tasks.parser import parse_control_task_request
 from umabot.tasks.schedule import compute_initial_next_run_at, compute_next_run_at
 from umabot.tools import ToolRegistry, UnifiedToolRegistry
+from umabot.tools.builtin import set_active_skill_env
 
 
 logger = logging.getLogger("umabot.worker")
@@ -42,31 +45,63 @@ class Worker:
         self.send_message = send_message
         self.send_control_message = send_control_message
         self._stop = asyncio.Event()
-        self._task: Optional[asyncio.Task] = None
+        self._tasks: List[asyncio.Task] = []
         self._chat_locks: Dict[str, asyncio.Lock] = {}
-        self._context_state = SkillToolContextState(revision=0, fingerprint="", system_messages=[], dynamic_tool_map={})
+        self._context_state = ContextState(revision=0, fingerprint="", system_messages=[])
 
-        self.llm_client = _build_llm_client(config)
+        # Build a shared token bucket when agents are enabled and a budget is configured.
+        # The same bucket is shared across all LLM clients so the total token spend
+        # per minute is capped — regardless of which client fires a request.
+        agents_cfg = getattr(config, "agents", None)
+        tpm = getattr(agents_cfg, "tokens_per_minute", 0) if agents_cfg else 0
+        self._token_bucket: TokenBucket | None = TokenBucket(tpm) if tpm > 0 else None
+
+        self.llm_client = _build_llm_client(config, rate_limiter=self._token_bucket)
+
+        # Build separate LLM clients for the orchestration system if enabled.
+        # Both inherit missing fields (provider, api_key) from the top-level llm config.
+        if agents_cfg and agents_cfg.enabled:
+            self.orchestrator_llm = _build_agent_llm_client(
+                config, agents_cfg.orchestrator, rate_limiter=self._token_bucket
+            )
+            self.agent_llm = _build_agent_llm_client(
+                config, agents_cfg.worker, rate_limiter=self._token_bucket
+            )
+        else:
+            self.orchestrator_llm = None
+            self.agent_llm = None
+
+    @property
+    def _concurrency(self) -> int:
+        return max(1, getattr(getattr(self.config, "worker", None), "concurrency", 1))
 
     async def start(self) -> None:
         self._stop.clear()
-        self._task = asyncio.create_task(self._run())
+        self._tasks = [
+            asyncio.create_task(self._worker_loop(), name=f"worker-{i}")
+            for i in range(self._concurrency)
+        ]
+        logger.info("Worker started with concurrency=%d", self._concurrency)
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task:
-            self._task.cancel()
+        for task in self._tasks:
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
+        self._tasks = []
 
-    async def _run(self) -> None:
+    async def _worker_loop(self) -> None:
+        """Single worker loop — multiple of these run concurrently."""
         while not self._stop.is_set():
             job = await self.queue.claim()
             if not job:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
                 continue
+            # Clear any leftover skill env from the previous job in this loop.
+            set_active_skill_env(None)
             try:
                 await self._process_job(job)
                 await self.queue.complete(job["id"])
@@ -97,7 +132,9 @@ class Worker:
         lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
             self.skill_registry.refresh()
-            self._context_state = _refresh_context_state(self._context_state, self.skill_registry, self.tool_registry)
+            self._context_state = _refresh_context_state(
+                self._context_state, self.skill_registry, self.tool_registry
+            )
             if kind == "control":
                 handled = await self._handle_control_task_commands(
                     channel=channel,
@@ -109,20 +146,80 @@ class Worker:
                     return
 
             messages = self.db.list_recent_messages(session_id, limit=20)
-            if self._context_state.system_messages:
-                messages = list(self._context_state.system_messages) + messages
-            dynamic_tool_map = self._context_state.dynamic_tool_map
-            allowed_tools = self._allowed_tools(dynamic_tool_map)
-            tools_spec = _build_tool_specs(self.tool_registry, allowed_tools, self.skill_registry, dynamic_tool_map)
+
+            # Build system messages: skill catalog + active skill instructions.
+            # Also set the active skill's resolved env so shell.run and run_script
+            # use the correct PATH / venv for this job.
+            system_messages = _build_skill_system_messages(self.skill_registry, user_text=text)
+            if system_messages:
+                messages = system_messages + messages
+            matched_skill = self.skill_registry.match_trigger(text)
+            if matched_skill and matched_skill.resolved_runtime:
+                set_active_skill_env(matched_skill.resolved_runtime.env)
+
+            allowed_tools = self._allowed_tools()
+
+            # Route through the dynamic orchestrator when it's enabled
+            agents_cfg = getattr(self.config, "agents", None)
+            if agents_cfg and agents_cfg.enabled and self.orchestrator_llm:
+                logger.info(
+                    "Routing to DynamicOrchestrator kind=%s session_id=%s",
+                    kind, session_id,
+                )
+                # Pass the active skill's instructions to the orchestrator so it
+                # can include them in the spawned agent's system_prompt.
+                # We pass only the first 3000 chars to the orchestrator system prompt
+                # (to stay within rate limits); the full body goes to the agent context.
+                skill_context = ""
+                if matched_skill and matched_skill.metadata.body:
+                    body = matched_skill.metadata.body
+                    skill_context = (
+                        f"ACTIVE SKILL: {matched_skill.metadata.name}\n"
+                        f"Skill directory: {matched_skill.path}\n"
+                        f"Instructions (give the FULL text below to the relevant spawned agent's system_prompt and context):\n"
+                        f"{body[:3000]}"
+                        + ("... [truncated — pass full instructions to agent context]" if len(body) > 3000 else "")
+                    )
+                    # Store full body so orchestrator can include it in agent context
+                    # by referencing skill_context_full
+                skill_context_full = ""
+                if matched_skill and matched_skill.metadata.body:
+                    skill_context_full = (
+                        f"ACTIVE SKILL: {matched_skill.metadata.name}\n"
+                        f"Skill directory: {matched_skill.path}\n"
+                        f"{matched_skill.metadata.body}"
+                    )
+                try:
+                    final_reply = await self._run_with_orchestrator(
+                        task=text,
+                        history=messages,
+                        channel=channel,
+                        chat_id=chat_id,
+                        connector=connector,
+                        session_id=session_id,
+                        allowed_tools=allowed_tools,
+                        agents_cfg=agents_cfg,
+                        skill_context=skill_context,
+                        skill_context_full=skill_context_full,
+                    )
+                except Exception as exc:
+                    logger.exception("Orchestrator failed kind=%s error=%s", kind, exc)
+                    await self.send_message(channel, chat_id, f"Orchestrator failed: {exc}", connector=connector)
+                    return
+                if final_reply:
+                    self.db.add_message(session_id, "assistant", final_reply)
+                    await self.send_message(channel, chat_id, final_reply, connector=connector)
+                return
+
+            tools_spec = _build_tool_specs(self.tool_registry, allowed_tools)
 
             logger.debug(
-                "LLM request kind=%s session_id=%s messages=%s tools=%s ctx_rev=%s dyn_tools=%s",
+                "LLM request kind=%s session_id=%s messages=%s tools=%s ctx_rev=%s",
                 kind,
                 session_id,
                 len(messages),
                 len(tools_spec),
                 self._context_state.revision,
-                len(dynamic_tool_map),
             )
             try:
                 response = await self.llm_client.generate(messages, tools=tools_spec)
@@ -135,25 +232,6 @@ class Worker:
                 len(response.content or ""),
                 len(response.tool_calls),
             )
-            # Security: Do NOT log response.content - may contain sensitive user data
-            for call in response.tool_calls:
-                if call.name == "skills.run_script" or call.name.startswith("skill_"):
-                    script_name = str(call.arguments.get("script", "")).strip()
-                    input_obj = call.arguments.get("input")
-                    input_keys = sorted(list(input_obj.keys())) if isinstance(input_obj, dict) else []
-                    logger.debug(
-                        "LLM skill-call preview skill=%s script=%s input_keys=%s has_input=%s",
-                        call.arguments.get("skill"),
-                        script_name,
-                        input_keys,
-                        isinstance(input_obj, dict),
-                    )
-                    if script_name == "create":
-                        has_title = isinstance(input_obj, dict) and bool(str(input_obj.get("title", "")).strip())
-                        logger.debug(
-                            "LLM skill-call create validation has_title=%s",
-                            has_title,
-                        )
             assistant_message_id = self.db.add_message(
                 session_id, "assistant", response.content or ""
             )
@@ -166,39 +244,27 @@ class Worker:
 
             tool_results = []
             for tool_call in response.tool_calls:
-                # Security: Log only tool name and arg count, NOT actual arguments (may contain sensitive data)
                 arg_count = len(tool_call.arguments) if isinstance(tool_call.arguments, dict) else 0
                 logger.debug("Tool call requested name=%s arg_count=%s", tool_call.name, arg_count)
-                effective_name = tool_call.name
-                effective_args = tool_call.arguments
-                if tool_call.name in dynamic_tool_map:
-                    skill_name, script_name = dynamic_tool_map[tool_call.name]
-                    logger.debug(
-                        "Dynamic tool mapped llm_tool=%s -> skills.run_script skill=%s script=%s",
-                        tool_call.name,
-                        skill_name,
-                        script_name,
-                    )
-                    effective_name = "skills.run_script"
-                    effective_args = {
-                        "skill": skill_name,
-                        "script": script_name,
-                        "input": tool_call.arguments if isinstance(tool_call.arguments, dict) else {},
-                    }
                 decision = self.policy.evaluate(
-                    {"name": effective_name, "arguments": effective_args},
-                    allowed_tools + (["skills.run_script"] if "skills.run_script" in self.tool_registry.list() else []),
+                    {"name": tool_call.name, "arguments": tool_call.arguments, "id": tool_call.id},
+                    allowed_tools,
                     chat_id=chat_id,
                     channel=channel,
+                    connector=connector,
                     session_id=session_id,
                     message_id=assistant_message_id,
                     messages=messages,
                 )
                 if decision.require_confirmation:
-                    # Hash token for logging (security: don't log plaintext tokens)
                     token_hash = hashlib.sha256(decision.token.encode()).hexdigest()[:8]
                     logger.info("Tool confirmation required name=%s token_hash=%s", tool_call.name, token_hash)
-                    prompt = f"Reply YES {decision.token} to confirm"
+                    args_preview = json.dumps(tool_call.arguments, indent=2)[:400] if tool_call.arguments else ""
+                    prompt = (
+                        f"Tool confirmation required: `{tool_call.name}`\n"
+                        f"Arguments:\n{args_preview}\n\n"
+                        f"Reply YES {decision.token} to approve or NO {decision.token} to deny."
+                    )
                     await self.send_control_message(channel, chat_id, prompt)
                     self.db.add_audit(
                         "tool_confirmation_requested",
@@ -209,16 +275,23 @@ class Worker:
                     logger.info("Tool denied name=%s reason=%s", tool_call.name, decision.reason)
                     await self.send_message(channel, chat_id, f"Tool denied: {decision.reason}", connector=connector)
                     return
-                tool = self.tool_registry.get(effective_name)
+                tool = self.tool_registry.get(tool_call.name)
                 if not tool:
                     await self.send_message(channel, chat_id, f"Tool not found: {tool_call.name}", connector=connector)
                     return
-                result = await tool.handler(effective_args)
+                try:
+                    result = await tool.handler(tool_call.arguments)
+                except Exception as exc:
+                    logger.exception("Tool execution failed name=%s", tool_call.name)
+                    await self.send_message(
+                        channel, chat_id, f"Tool `{tool_call.name}` failed: {exc}", connector=connector
+                    )
+                    return
                 logger.debug("Tool result name=%s content_len=%s", tool_call.name, len(result.content or ""))
                 self.db.add_tool_call(
                     assistant_message_id,
                     tool_call.name,
-                    effective_args,
+                    tool_call.arguments,
                     {"content": result.content, "data": result.data},
                 )
                 tool_results.append((tool_call, result))
@@ -237,6 +310,40 @@ class Worker:
             if follow_up.content:
                 self.db.add_message(session_id, "assistant", follow_up.content)
                 await self.send_message(channel, chat_id, follow_up.content, connector=connector)
+
+    async def _run_with_orchestrator(
+        self,
+        *,
+        task: str,
+        history: List[Dict[str, Any]],
+        channel: str,
+        chat_id: str,
+        connector: str,
+        session_id: int,
+        allowed_tools: List[str],
+        agents_cfg,
+        skill_context: str = "",
+        skill_context_full: str = "",
+    ) -> str:
+        """Delegate a task to the DynamicOrchestrator and return the final reply."""
+
+        async def send_update(message: str) -> None:
+            await self.send_message(channel, chat_id, f"[update] {message}", connector=connector)
+
+        orchestrator = DynamicOrchestrator(
+            orchestrator_llm=self.orchestrator_llm,
+            agent_llm=self.agent_llm,
+            tool_registry=self.tool_registry,
+            available_tool_names=allowed_tools,
+            send_update_callback=send_update,
+            request_approval_callback=None,
+            max_orchestrator_iterations=agents_cfg.max_orchestrator_iterations,
+            max_agent_iterations=agents_cfg.max_agent_iterations,
+            skill_context=skill_context,
+            skill_context_full=skill_context_full,
+        )
+
+        return await orchestrator.run(task=task, history=history)
 
     async def _process_task_run(self, payload: Dict[str, Any]) -> None:
         task_id = int(payload.get("task_id", 0))
@@ -260,20 +367,28 @@ class Worker:
         self.db.add_message(session_id, "user", run_text)
         messages = self.db.list_recent_messages(session_id, limit=20)
         self.skill_registry.refresh()
-        self._context_state = _refresh_context_state(self._context_state, self.skill_registry, self.tool_registry)
-        if self._context_state.system_messages:
-            messages = list(self._context_state.system_messages) + messages
-        dynamic_tool_map = self._context_state.dynamic_tool_map
-        allowed_tools = self._allowed_tools(dynamic_tool_map)
-        tools_spec = _build_tool_specs(self.tool_registry, allowed_tools, self.skill_registry, dynamic_tool_map)
+        self._context_state = _refresh_context_state(
+            self._context_state, self.skill_registry, self.tool_registry
+        )
+
+        # Build system messages with skill matching on the task prompt.
+        # Set the active skill env so tool calls in this task job use the right runtime.
+        system_messages = _build_skill_system_messages(self.skill_registry, user_text=prompt)
+        if system_messages:
+            messages = system_messages + messages
+        matched_skill = self.skill_registry.match_trigger(prompt)
+        if matched_skill and matched_skill.resolved_runtime:
+            set_active_skill_env(matched_skill.resolved_runtime.env)
+
+        allowed_tools = self._allowed_tools()
+        tools_spec = _build_tool_specs(self.tool_registry, allowed_tools)
         logger.debug(
-            "Task run LLM request task_id=%s run_id=%s messages=%s tools=%s ctx_rev=%s dyn_tools=%s",
+            "Task run LLM request task_id=%s run_id=%s messages=%s tools=%s ctx_rev=%s",
             task_id,
             run_id,
             len(messages),
             len(tools_spec),
             self._context_state.revision,
-            len(dynamic_tool_map),
         )
         try:
             response = await self.llm_client.generate(messages, tools=tools_spec)
@@ -283,25 +398,9 @@ class Worker:
             if response.tool_calls:
                 tool_results = []
                 for tool_call in response.tool_calls:
-                    effective_name = tool_call.name
-                    effective_args = tool_call.arguments
-                    if tool_call.name in dynamic_tool_map:
-                        skill_name, script_name = dynamic_tool_map[tool_call.name]
-                        logger.debug(
-                            "Dynamic tool mapped llm_tool=%s -> skills.run_script skill=%s script=%s",
-                            tool_call.name,
-                            skill_name,
-                            script_name,
-                        )
-                        effective_name = "skills.run_script"
-                        effective_args = {
-                            "skill": skill_name,
-                            "script": script_name,
-                            "input": tool_call.arguments if isinstance(tool_call.arguments, dict) else {},
-                        }
                     decision = self.policy.evaluate(
-                        {"name": effective_name, "arguments": effective_args},
-                        allowed_tools + (["skills.run_script"] if "skills.run_script" in self.tool_registry.list() else []),
+                        {"name": tool_call.name, "arguments": tool_call.arguments},
+                        allowed_tools,
                         chat_id=chat_id,
                         channel="system",
                         session_id=session_id,
@@ -318,17 +417,17 @@ class Worker:
                         self.db.fail_task_run(run_id=run_id, task_id=task_id, error=text)
                         await self.send_control_message("system", chat_id, text)
                         return
-                    tool = self.tool_registry.get(effective_name)
+                    tool = self.tool_registry.get(tool_call.name)
                     if not tool:
                         text = f"Task #{task_id} missing tool '{tool_call.name}'"
                         self.db.fail_task_run(run_id=run_id, task_id=task_id, error=text)
                         await self.send_control_message("system", chat_id, text)
                         return
-                    result = await tool.handler(effective_args)
+                    result = await tool.handler(tool_call.arguments)
                     self.db.add_tool_call(
                         assistant_message_id,
                         tool_call.name,
-                        effective_args,
+                        tool_call.arguments,
                         {"content": result.content, "data": result.data},
                     )
                     tool_results.append((tool_call, result))
@@ -373,6 +472,7 @@ class Worker:
         pending = payload["pending"]
         chat_id = pending["chat_id"]
         channel = pending["channel"]
+        connector = pending.get("connector", "")
         session_id = pending["session_id"]
         message_id = pending["message_id"]
         tool_call = pending["tool_call"]
@@ -380,9 +480,16 @@ class Worker:
 
         tool = self.tool_registry.get(tool_call["name"])
         if not tool:
-            await self.send_message(channel, chat_id, "Tool not found for confirmation.")
+            await self.send_message(channel, chat_id, "Tool not found for confirmation.", connector=connector)
             return
-        result = await tool.handler(tool_call["arguments"])
+        try:
+            result = await tool.handler(tool_call["arguments"])
+        except Exception as exc:
+            logger.exception("Tool execution failed after confirmation name=%s", tool_call["name"])
+            await self.send_message(
+                channel, chat_id, f"Tool `{tool_call['name']}` failed to execute: {exc}", connector=connector
+            )
+            return
         self.db.add_tool_call(
             message_id,
             tool_call["name"],
@@ -392,13 +499,13 @@ class Worker:
         tool_message = {
             "role": "tool",
             "content": result.content,
-            "name": tool_call["name"],
+            "tool_call_id": tool_call.get("id", ""),
         }
         messages.append(tool_message)
         follow_up = await self.llm_client.generate(messages, tools=None)
         if follow_up.content:
             self.db.add_message(session_id, "assistant", follow_up.content)
-            await self.send_message(channel, chat_id, follow_up.content)
+            await self.send_message(channel, chat_id, follow_up.content, connector=connector)
 
     async def _handle_control_task_commands(
         self,
@@ -482,40 +589,56 @@ class Worker:
         )
         return True
 
-    def _allowed_tools(self, dynamic_tool_map: Optional[Dict[str, tuple[str, str]]] = None) -> list[str]:
+    def _allowed_tools(self) -> list[str]:
         if self.policy.strictness == "strict":
             return []
-        names = [name for name in self.tool_registry.list().keys() if name != "skills.run_script"]
-        if dynamic_tool_map:
-            names.extend(dynamic_tool_map.keys())
-        return names
+        return list(self.tool_registry.list().keys())
 
 
-def _build_llm_client(config):
+def _build_agent_llm_client(config, agent_model_cfg, rate_limiter=None):
+    """Build an LLM client for a specific agent role config.
+
+    Fields left empty/None in ``agent_model_cfg`` inherit from ``config.llm``.
+    The optional ``rate_limiter`` (TokenBucket) is shared across all clients.
+    """
+    provider = agent_model_cfg.provider or config.llm.provider
+    model = agent_model_cfg.model or config.llm.model
+    api_key = agent_model_cfg.api_key or config.llm.api_key
+    reasoning_effort = agent_model_cfg.reasoning_effort
+
+    if not api_key:
+        raise RuntimeError("Agent LLM API key not configured")
+
+    provider = provider.lower()
+    if provider == "openai":
+        return OpenAIClient(api_key, model, reasoning_effort=reasoning_effort, rate_limiter=rate_limiter)
+    if provider == "claude":
+        return ClaudeClient(api_key, model, rate_limiter=rate_limiter)
+    if provider == "gemini":
+        return GeminiClient(api_key, model, rate_limiter=rate_limiter)
+    raise RuntimeError(f"Unknown LLM provider for agent: {provider}")
+
+
+def _build_llm_client(config, rate_limiter=None):
     provider = config.llm.provider.lower()
     api_key = config.llm.api_key
     if not api_key:
         raise RuntimeError("LLM API key not configured")
     if provider == "openai":
-        return OpenAIClient(api_key, config.llm.model)
+        return OpenAIClient(api_key, config.llm.model, reasoning_effort=config.llm.reasoning_effort, rate_limiter=rate_limiter)
     if provider == "claude":
-        return ClaudeClient(api_key, config.llm.model)
+        return ClaudeClient(api_key, config.llm.model, rate_limiter=rate_limiter)
     if provider == "gemini":
-        return GeminiClient(api_key, config.llm.model)
+        return GeminiClient(api_key, config.llm.model, rate_limiter=rate_limiter)
     raise RuntimeError(f"Unknown LLM provider: {provider}")
 
 
 def _build_tool_specs(
     registry: ToolRegistry,
     allowed_tools: list[str],
-    skill_registry: Optional[SkillRegistry] = None,
-    dynamic_tool_map: Optional[Dict[str, tuple[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     specs = []
-    dynamic_schema_map = _dynamic_skill_tool_schemas(skill_registry) if skill_registry else {}
     for tool in registry.list().values():
-        if tool.name == "skills.run_script":
-            continue
         if tool.name not in allowed_tools:
             continue
         specs.append(
@@ -523,17 +646,6 @@ def _build_tool_specs(
                 "name": tool.name,
                 "description": tool.description or "",
                 "parameters": tool.schema,
-            }
-        )
-    for dyn_name, schema in dynamic_schema_map.items():
-        if dyn_name not in allowed_tools:
-            continue
-        skill_name, script_name = (dynamic_tool_map or {}).get(dyn_name, ("", ""))
-        specs.append(
-            {
-                "name": dyn_name,
-                "description": f"Run skill script {skill_name}.{script_name}",
-                "parameters": schema,
             }
         )
     return specs
@@ -555,111 +667,76 @@ def _tool_call_payload(call) -> Dict[str, Any]:
 
 
 @dataclass
-class SkillToolContextState:
+class ContextState:
     revision: int
     fingerprint: str
     system_messages: List[Dict[str, str]]
-    dynamic_tool_map: Dict[str, tuple[str, str]]
 
 
 def _refresh_context_state(
-    previous: SkillToolContextState,
+    previous: ContextState,
     skill_registry: SkillRegistry,
     tool_registry: ToolRegistry,
-) -> SkillToolContextState:
+) -> ContextState:
     fingerprint = _context_fingerprint(skill_registry, tool_registry)
     if fingerprint == previous.fingerprint:
         return previous
-    dynamic_tool_map = _dynamic_skill_tool_map(skill_registry)
-    system_messages = _build_skill_system_messages(skill_registry, dynamic_tool_map)
-    return SkillToolContextState(
+    system_messages = _build_skill_system_messages(skill_registry)
+    return ContextState(
         revision=previous.revision + 1,
         fingerprint=fingerprint,
         system_messages=system_messages,
-        dynamic_tool_map=dynamic_tool_map,
     )
 
 
 def _context_fingerprint(skill_registry: SkillRegistry, tool_registry: ToolRegistry) -> str:
     tools = sorted(tool_registry.list().keys())
-    skills_repr: List[Dict[str, Any]] = []
+    skills_repr = []
     for skill in sorted(skill_registry.list(), key=lambda s: s.metadata.name):
-        scripts = sorted(skill.metadata.scripts.items(), key=lambda kv: kv[0])
-        skills_repr.append(
-            {
-                "name": skill.metadata.name,
-                "version": skill.metadata.version,
-                "allowed_tools": list(skill.metadata.allowed_tools),
-                "scripts": scripts,
-            }
-        )
+        skills_repr.append({"name": skill.metadata.name, "desc": skill.metadata.description})
     raw = json.dumps({"tools": tools, "skills": skills_repr}, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _build_skill_system_messages(
     skill_registry: SkillRegistry,
-    dynamic_tool_map: Dict[str, tuple[str, str]],
+    user_text: Optional[str] = None,
 ) -> List[Dict[str, str]]:
+    """Build system messages for skill context.
+
+    1. Always includes a skill catalog (all skill names + descriptions).
+    2. If user_text is provided and matches a skill, injects the full
+       SKILL.md body as active skill instructions.
+    """
     skills = skill_registry.list()
     if not skills:
+        logger.debug("No skills loaded in registry")
         return []
-    lines: List[str] = [
-        "Skill Tools Catalog (updated runtime state):",
-        "Select the best matching skill tool and pass valid structured input.",
-        "If required fields are unknown, ask one clarification question.",
-        "Available tools:",
+
+    logger.debug("Skill catalog: %d skills loaded", len(skills))
+    messages: List[Dict[str, str]] = []
+
+    # Skill catalog — always present
+    catalog_lines = [
+        "Available skills (activate by matching user intent):",
     ]
-    for dyn_tool_name in sorted(dynamic_tool_map.keys()):
-        skill_name, script_name = dynamic_tool_map[dyn_tool_name]
-        skill = skill_registry.get(skill_name)
-        if not skill:
-            continue
-        script_spec = skill.metadata.scripts.get(script_name, {})
-        req = script_spec.get("input_schema", {}).get("required", [])
-        examples = script_spec.get("examples", [])
-        example_hint = ""
-        if examples and isinstance(examples, list):
-            first = examples[0]
-            if isinstance(first, dict):
-                example_hint = f" example={json.dumps(first, ensure_ascii=True)}"
-        lines.append(
-            f"- {dyn_tool_name}: skill={skill_name} script={script_name}"
-            f" required={req}{example_hint}"
-        )
-    return [{"role": "system", "content": "\n".join(lines)}]
+    for skill in sorted(skills, key=lambda s: s.metadata.name):
+        catalog_lines.append(f"- {skill.metadata.name}: {skill.metadata.description}")
+    messages.append({"role": "system", "content": "\n".join(catalog_lines)})
 
-
-def _dynamic_skill_tool_map(skill_registry: SkillRegistry) -> Dict[str, tuple[str, str]]:
-    mapping: Dict[str, tuple[str, str]] = {}
-    for skill in skill_registry.list():
-        for script_name, script_spec in skill.metadata.scripts.items():
-            if not isinstance(script_spec, dict):
-                continue
-            mapping[_dynamic_skill_tool_name(skill.metadata.name, script_name)] = (
-                skill.metadata.name,
-                script_name,
+    # Active skill — inject full instructions when matched
+    if user_text:
+        matched = skill_registry.match_trigger(user_text)
+        if matched and matched.metadata.body:
+            logger.debug("Skill matched: %s for text: %.80s", matched.metadata.name, user_text)
+            instructions = (
+                f"ACTIVE SKILL: {matched.metadata.name}\n"
+                f"Skill directory: {matched.path}\n"
+                f"Follow these instructions to complete the task:\n\n"
+                f"{matched.metadata.body}"
             )
-    return mapping
+            messages.append({"role": "system", "content": instructions})
+        else:
+            logger.debug("No skill matched for text: %.80s", user_text)
 
-
-def _dynamic_skill_tool_schemas(skill_registry: SkillRegistry) -> Dict[str, Dict[str, Any]]:
-    schemas: Dict[str, Dict[str, Any]] = {}
-    for skill in skill_registry.list():
-        for script_name, script_spec in skill.metadata.scripts.items():
-            if not isinstance(script_spec, dict):
-                continue
-            input_schema = script_spec.get("input_schema")
-            if not isinstance(input_schema, dict) or not input_schema:
-                input_schema = {"type": "object", "additionalProperties": True}
-            if input_schema.get("type") != "object":
-                input_schema = {"type": "object", "additionalProperties": True}
-            schemas[_dynamic_skill_tool_name(skill.metadata.name, script_name)] = input_schema
-    return schemas
-
-
-def _dynamic_skill_tool_name(skill_name: str, script_name: str) -> str:
-    def _safe(value: str) -> str:
-        return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in value)
-
-    return f"skill_{_safe(skill_name)}_{_safe(script_name)}"
+    return messages

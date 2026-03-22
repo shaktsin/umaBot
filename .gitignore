@@ -221,3 +221,7 @@ docs/
 
 .staging/
 .tests/
+# Node / frontend tooling (root-level artifacts)
+/node_modules/
+/package.json
+/package-lock.json
