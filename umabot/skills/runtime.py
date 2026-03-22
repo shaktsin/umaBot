@@ -1,315 +1,214 @@
+"""Skill runtime provisioning — resolves binary paths and installs dependencies.
+
+Precedence model (highest wins):
+  1. config.yaml  skills.<name>   — user per-skill override
+  2. config.yaml  skills.defaults — user global defaults
+  3. SKILL.md     runtime:        — skill author's declared requirements
+
+At skill load time, SkillRuntimeProvisioner reads each skill's runtime spec,
+merges it with the user's config, creates an isolated .venv for Python skills,
+and builds the full env dict stored on Skill.resolved_runtime.
+
+The env dict is picked up by shell.run / skills.run_script via a ContextVar
+set per-job in the worker.
+"""
+
 from __future__ import annotations
 
-import asyncio
-import json
+import hashlib
 import logging
 import os
-import signal
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
-from jsonschema import ValidationError, validate
-
-from .registry import SkillRegistry
+if TYPE_CHECKING:
+    from umabot.config.schema import SkillRuntimeOverride, SkillsConfig
+    from umabot.skills.registry import Skill
 
 logger = logging.getLogger("umabot.skills.runtime")
 
 
 @dataclass
-class SkillRunResult:
-    ok: bool
-    output: str
-    data: Optional[Dict[str, Any]] = None
+class ResolvedRuntime:
+    """Fully resolved runtime environment for a skill."""
+
+    skill_dir: Path
+    python_bin: str      # Absolute path to the Python binary to use
+    timeout_seconds: int
+    # Complete env dict passed as env= to subprocess calls for this skill.
+    # Snapshot of os.environ + PATH additions + skill-specific vars.
+    env: Dict[str, str] = field(default_factory=dict)
 
 
-class SkillRuntime:
-    """Isolated skill script runtime.
+class SkillRuntimeProvisioner:
+    """Provisions skill runtimes at load time.
 
-    Scripts are executed as subprocesses inside per-skill virtualenvs.
+    Reads ``config.yaml`` skills section and each skill's SKILL.md runtime: spec,
+    merges them with the precedence model described above, provisions venvs, and
+    returns a ResolvedRuntime ready for subprocess injection.
     """
 
-    def __init__(self, *, skill_registry: SkillRegistry, config) -> None:
-        self.skill_registry = skill_registry
-        self.config = config
+    def __init__(self, skills_config: "SkillsConfig") -> None:
+        self._cfg = skills_config
 
-    async def run_script(self, *, skill_name: str, script: str, payload: Dict[str, Any]) -> SkillRunResult:
-        logger.debug(
-            "Skill runtime request skill=%s script=%s payload_keys=%s",
-            skill_name,
-            script,
-            sorted(list(payload.keys())) if isinstance(payload, dict) else [],
-        )
-        skill = self.skill_registry.get(skill_name)
-        if not skill:
-            logger.debug("Skill runtime rejected missing skill=%s", skill_name)
-            return SkillRunResult(ok=False, output=f"Skill not found: {skill_name}")
-        script_spec = skill.metadata.scripts.get(script)
-        if not script_spec:
-            logger.debug("Skill runtime rejected undeclared script=%s for skill=%s", script, skill_name)
-            return SkillRunResult(ok=False, output=f"Script '{script}' not declared by skill '{skill_name}'")
-        if not isinstance(payload, dict):
-            payload = {}
-        payload = _apply_arg_mapping(payload, script_spec.get("arg_mapping") or {})
-        schema = script_spec.get("input_schema") or {}
-        if schema:
-            try:
-                validate(instance=payload, schema=schema)
-            except ValidationError as exc:
-                detail = {
-                    "type": "validation_error",
-                    "skill": skill_name,
-                    "script": script,
-                    "message": exc.message,
-                    "path": list(exc.absolute_path),
-                    "required": schema.get("required", []),
-                }
-                logger.debug(
-                    "Skill runtime validation failed skill=%s script=%s message=%s",
-                    skill_name,
-                    script,
-                    exc.message,
+    def provision(self, skill: "Skill") -> ResolvedRuntime:
+        """Provision the runtime for a skill and return a ResolvedRuntime.
+
+        Safe to call on every gateway start — idempotent if nothing changed.
+        Errors are logged but never raised (a broken skill env degrades gracefully).
+        """
+        spec = skill.metadata.runtime          # SKILL.md runtime: section
+        skill_dir = skill.path
+        defaults = self._cfg.defaults          # config.yaml skills.defaults
+        per_skill = self._cfg.get_skill_override(skill.metadata.name)  # config.yaml skills.<name>
+
+        python_bin = self._resolve_python(spec, defaults, per_skill)
+        node_bin_dir = self._resolve_node_bin_dir(spec, defaults, per_skill)
+        env = self._build_env(spec, skill_dir, python_bin, node_bin_dir, defaults, per_skill)
+
+        # Provision Python venv if requirements declared in SKILL.md
+        if spec.requirements:
+            req_file = skill_dir / spec.requirements
+            if req_file.exists():
+                try:
+                    venv_python = self._ensure_venv(skill_dir, python_bin, req_file)
+                    venv_dir = skill_dir / ".venv"
+                    env = self._build_env(spec, skill_dir, venv_python, node_bin_dir, defaults, per_skill)
+                    env["VIRTUAL_ENV"] = str(venv_dir)
+                    env["PATH"] = str(venv_dir / "bin") + os.pathsep + env.get("PATH", "")
+                    python_bin = venv_python
+                    logger.info("Skill '%s' venv ready: %s", skill.metadata.name, venv_dir)
+                except Exception as exc:
+                    logger.warning(
+                        "Skill '%s' venv provisioning failed: %s — using system Python",
+                        skill.metadata.name, exc,
+                    )
+            else:
+                logger.warning(
+                    "Skill '%s' declares requirements=%s but file not found at %s",
+                    skill.metadata.name, spec.requirements, req_file,
                 )
-                return SkillRunResult(
-                    ok=False,
-                    output=json.dumps(detail, ensure_ascii=True),
-                    data=detail,
-                )
-        script_rel = str(script_spec.get("path", "")).strip()
-        script_path = (skill.path / script_rel).resolve()
-        if not script_path.exists() or not script_path.is_file():
-            logger.debug("Skill runtime missing script file skill=%s script=%s path=%s", skill_name, script, script_path)
-            return SkillRunResult(ok=False, output=f"Script file not found: {script_rel}")
-        if skill.path.resolve() not in script_path.parents:
-            logger.warning("Skill runtime blocked unsafe script path skill=%s path=%s", skill_name, script_path)
-            return SkillRunResult(ok=False, output="Unsafe script path")
 
-        # Detect script type and build command
-        script_type = self._detect_script_type(script_path)
-        cmd = self._build_script_command(skill.path, script_path, script_type)
-        if not cmd:
-            logger.debug("Skill runtime cannot execute script skill=%s type=%s", skill_name, script_type)
-            return SkillRunResult(ok=False, output=f"Unsupported script type: {script_type}")
-
-        runtime_cfg = skill.metadata.runtime or {}
-        timeout = int(runtime_cfg.get("timeout_seconds", 20))
-        env = self._build_env(skill_name)
-        config_args = self.config.skill_configs.get(skill_name, {}).get("args", {})
-        if not isinstance(config_args, dict):
-            config_args = {}
-
-        # For bash scripts, pass payload as JSON via stdin
-        # For Python scripts, pass payload as JSON via stdin
-        stdin_data = json.dumps(
-            {
-                "input": payload,
-                "config": config_args,
-            }
-        ).encode("utf-8")
-
-        proc = await asyncio.to_thread(
-            self._spawn_process,
-            cmd,
-            str(skill.path),
-            env,
+        return ResolvedRuntime(
+            skill_dir=skill_dir,
+            python_bin=python_bin,
+            timeout_seconds=spec.timeout_seconds,
+            env=env,
         )
-        logger.debug(
-            "Skill runtime spawned pid=%s skill=%s script=%s timeout=%ss",
-            getattr(proc, "pid", None),
-            skill_name,
-            script,
-            timeout,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                asyncio.to_thread(proc.communicate, stdin_data),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Skill runtime timeout skill=%s script=%s timeout=%ss", skill_name, script, timeout)
-            _terminate_process(proc)
-            return SkillRunResult(ok=False, output=f"Skill script timed out after {timeout}s")
-        except Exception as exc:
-            logger.exception("Skill runtime execution error skill=%s script=%s", skill_name, script)
-            _terminate_process(proc)
-            return SkillRunResult(ok=False, output=f"Skill script failed: {exc}")
 
-        out_text = (stdout or b"").decode("utf-8", errors="replace").strip()
-        err_text = (stderr or b"").decode("utf-8", errors="replace").strip()
-        if proc.returncode != 0:
-            detail = err_text or out_text or f"exit_code={proc.returncode}"
-            logger.debug(
-                "Skill runtime non-zero exit skill=%s script=%s code=%s detail=%s",
-                skill_name,
-                script,
-                proc.returncode,
-                detail,
-            )
-            return SkillRunResult(ok=False, output=f"Skill script failed: {detail}")
-        if not out_text:
-            logger.debug("Skill runtime completed with empty output skill=%s script=%s", skill_name, script)
-            return SkillRunResult(ok=True, output="")
-        try:
-            data = json.loads(out_text)
-            if isinstance(data, dict):
-                message = str(data.get("message") or "")
-                logger.debug(
-                    "Skill runtime completed skill=%s script=%s message_len=%s has_data=%s",
-                    skill_name,
-                    script,
-                    len(message),
-                    bool(data),
-                )
-                return SkillRunResult(ok=True, output=message, data=data)
-        except json.JSONDecodeError:
-            pass
-        logger.debug(
-            "Skill runtime completed skill=%s script=%s plain_output_len=%s",
-            skill_name,
-            script,
-            len(out_text),
-        )
-        return SkillRunResult(ok=True, output=out_text)
+    # ------------------------------------------------------------------
+    # Resolution helpers  (precedence: per_skill > defaults > spec > system)
+    # ------------------------------------------------------------------
 
-    def _build_env(self, skill_name: str) -> Dict[str, str]:
-        env_cfg = self.config.skill_configs.get(skill_name, {}).get("env", {})
-        env = {
-            "PYTHONUNBUFFERED": "1",
-            "LANG": "C.UTF-8",
-            "LC_ALL": "C.UTF-8",
-            "PATH": os.environ.get("PATH", ""),
-        }
-        # Resolve env vars declared in the skill manifest.
-        # Priority: config.yaml value > host environment variable
-        skill = self.skill_registry.get(skill_name)
-        if skill:
-            declared_env = (skill.metadata.install_config or {}).get("env", {})
-            for key in declared_env:
-                key_str = str(key)
-                if key_str not in env_cfg and key_str in os.environ:
-                    env[key_str] = os.environ[key_str]
-        for key, value in env_cfg.items():
-            env[str(key)] = str(value)
+    def _resolve_python(self, spec, defaults, per_skill) -> str:
+        for source in [per_skill, defaults]:
+            if source and source.python_bin:
+                p = Path(source.python_bin).expanduser()
+                if p.exists():
+                    return str(p)
+        if spec.python_bin:
+            p = Path(spec.python_bin).expanduser()
+            if p.exists():
+                return str(p)
+        return sys.executable
+
+    def _resolve_node_bin_dir(self, spec, defaults, per_skill) -> str:
+        for source in [per_skill, defaults]:
+            if source and source.node_bin:
+                p = Path(source.node_bin).expanduser()
+                if p.is_dir():
+                    return str(p)
+        if spec.node_bin:
+            p = Path(spec.node_bin).expanduser()
+            if p.is_dir():
+                return str(p)
+        return ""
+
+    def _build_env(self, spec, skill_dir: Path, python_bin: str, node_bin_dir: str,
+                   defaults, per_skill) -> Dict[str, str]:
+        """Build the full env dict for subprocess calls.
+
+        PATH order (prepended, highest priority first):
+          per_skill.extra_path → defaults.extra_path → spec.extra_path → node_bin_dir → python dir
+
+        Env vars order (merged, per_skill wins on conflict):
+          defaults.env → spec.env → per_skill.env
+        """
+        env = os.environ.copy()
+
+        # --- PATH additions ---
+        path_prepends: list[str] = []
+        for source_paths in [
+            per_skill.extra_path if per_skill else [],
+            defaults.extra_path,
+            spec.extra_path,
+        ]:
+            for p in source_paths:
+                expanded = str(Path(p).expanduser())
+                if expanded not in path_prepends:
+                    path_prepends.append(expanded)
+
+        if node_bin_dir and node_bin_dir not in path_prepends:
+            path_prepends.append(node_bin_dir)
+
+        python_dir = str(Path(python_bin).parent)
+        if python_dir not in path_prepends:
+            path_prepends.append(python_dir)
+
+        if path_prepends:
+            env["PATH"] = os.pathsep.join(path_prepends) + os.pathsep + env.get("PATH", "")
+
+        # --- Env vars (lowest → highest priority) ---
+        env.update(defaults.env)
+        env.update(spec.env)
+        if per_skill:
+            env.update(per_skill.env)
+
+        env["SKILL_DIR"] = str(skill_dir)
         return env
 
-    def _skill_python(self, skill_path: Path) -> Path:
-        if sys.platform == "win32":
-            return skill_path / ".venv" / "Scripts" / "python.exe"
-        return skill_path / ".venv" / "bin" / "python"
+    # ------------------------------------------------------------------
+    # venv provisioning
+    # ------------------------------------------------------------------
 
-    def _detect_script_type(self, script_path: Path) -> str:
-        """Detect script type from extension or shebang."""
-        ext = script_path.suffix.lower()
+    def _ensure_venv(self, skill_dir: Path, python_bin: str, req_file: Path) -> str:
+        """Create or update the .venv in skill_dir. Returns path to venv python."""
+        venv_dir = skill_dir / ".venv"
+        req_hash_file = venv_dir / ".req_hash"
+        current_hash = _hash_file(req_file)
 
-        if ext == ".py":
-            return "python"
-        elif ext in {".sh", ".bash"}:
-            return "bash"
+        if venv_dir.exists() and req_hash_file.exists():
+            if req_hash_file.read_text().strip() == current_hash:
+                venv_python = _venv_python(venv_dir)
+                if Path(venv_python).exists():
+                    return venv_python
 
-        # Try to detect from shebang
-        try:
-            with open(script_path, "r", encoding="utf-8") as f:
-                first_line = f.readline().strip()
-                if first_line.startswith("#!"):
-                    if "python" in first_line:
-                        return "python"
-                    elif "bash" in first_line or "sh" in first_line:
-                        return "bash"
-        except Exception:
-            pass
+        logger.info("Provisioning venv for skill at %s (requirements: %s)", skill_dir, req_file)
 
-        # Default to python for backward compatibility
-        return "python"
-
-    def _build_script_command(self, skill_path: Path, script_path: Path, script_type: str) -> list[str]:
-        """Build command to execute script based on type."""
-        if script_type == "python":
-            python_exe = self._skill_python(skill_path)
-            if not python_exe.exists():
-                logger.debug("Missing venv python at %s", python_exe)
-                return []
-            return [str(python_exe), str(script_path)]
-
-        elif script_type == "bash":
-            # Use system bash
-            bash_exe = "bash"
-            if sys.platform == "win32":
-                # On Windows, try to find bash (Git Bash, WSL, etc.)
-                import shutil as sh
-                bash_path = sh.which("bash")
-                if not bash_path:
-                    logger.warning("Bash not found on Windows")
-                    return []
-                bash_exe = bash_path
-            return [bash_exe, str(script_path)]
-
-        return []
-
-    def _spawn_process(self, cmd: list[str], cwd: str, env: Dict[str, str]) -> subprocess.Popen:
-        preexec = _preexec_limits if os.name != "nt" else None
-        return subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            preexec_fn=preexec,
+        subprocess.run(
+            [python_bin, "-m", "venv", str(venv_dir)],
+            check=True, capture_output=True, text=True,
         )
+        venv_python = _venv_python(venv_dir)
+        subprocess.run(
+            [venv_python, "-m", "pip", "install", "-r", str(req_file), "--quiet"],
+            check=True, capture_output=True, text=True,
+        )
+        req_hash_file.write_text(current_hash)
+        return venv_python
 
 
-def _terminate_process(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        if os.name != "nt":
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except Exception:
-        proc.kill()
+def _venv_python(venv_dir: Path) -> str:
+    unix = venv_dir / "bin" / "python"
+    if unix.exists():
+        return str(unix)
+    return str(venv_dir / "Scripts" / "python.exe")
 
 
-def _preexec_limits() -> None:
-    # Best-effort resource limits for skill subprocesses.
-    os.setsid()
-    try:
-        import resource
-
-        resource.setrlimit(resource.RLIMIT_CPU, (20, 20))
-        mem = 512 * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
-    except Exception:
-        pass
-
-
-def _apply_arg_mapping(payload: Dict[str, Any], arg_mapping: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(payload, dict):
-        return {}
-    mapped = dict(payload)
-    for target, aliases in arg_mapping.items():
-        target_key = str(target).strip()
-        if not target_key:
-            continue
-        existing = mapped.get(target_key)
-        if isinstance(existing, str) and existing.strip():
-            continue
-        if existing not in (None, "", []):
-            continue
-        alias_list = aliases if isinstance(aliases, list) else [aliases]
-        for alias in alias_list:
-            alias_key = str(alias).strip()
-            if not alias_key:
-                continue
-            value = mapped.get(alias_key)
-            if isinstance(value, str):
-                if value.strip():
-                    mapped[target_key] = value
-                    break
-            elif value is not None:
-                mapped[target_key] = value
-                break
-    return mapped
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()

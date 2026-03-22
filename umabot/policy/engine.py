@@ -26,6 +26,7 @@ class PendingConfirmation:
     message_id: int
     tool_call: Dict[str, Any]
     messages: list[dict]
+    connector: str = ""  # original connector — used to route the final response back
 
 
 class PolicyEngine:
@@ -41,6 +42,7 @@ class PolicyEngine:
         *,
         chat_id: str,
         channel: str,
+        connector: str = "",
         session_id: int,
         message_id: int,
         messages: list[dict],
@@ -60,7 +62,7 @@ class PolicyEngine:
 
         if tool.risk_level == RISK_RED:
             token = self._create_confirmation(
-                chat_id, channel, session_id, message_id, tool_call, messages
+                chat_id, channel, connector, session_id, message_id, tool_call, messages
             )
             return PolicyDecision(False, True, token=token)
         return PolicyDecision(True, False)
@@ -69,6 +71,7 @@ class PolicyEngine:
         self,
         chat_id: str,
         channel: str,
+        connector: str,
         session_id: int,
         message_id: int,
         tool_call: Dict[str, Any],
@@ -79,6 +82,7 @@ class PolicyEngine:
             token=token,
             chat_id=chat_id,
             channel=channel,
+            connector=connector,
             session_id=session_id,
             message_id=message_id,
             tool_call=tool_call,
@@ -89,7 +93,27 @@ class PolicyEngine:
 
     def consume_confirmation(self, chat_id: str, message: str) -> Optional[PendingConfirmation]:
         message = message.strip()
-        if not message.upper().startswith("YES "):
+        upper = message.upper()
+
+        # Accept plain "y" or "yes" to confirm the most recent pending for this chat
+        if upper in ("Y", "YES"):
+            # Find the most recent pending confirmation for this chat_id
+            matching_keys = [k for k in self._pending if k[0] == chat_id]
+            if matching_keys:
+                key = matching_keys[-1]
+                return self._pending.pop(key, None)
+            return None
+
+        # Accept "YES <token>" for explicit token confirmation
+        if not upper.startswith("YES "):
             return None
         token = message.split(" ", 1)[1].strip()
-        return self._pending.pop((chat_id, token), None)
+        # Try exact chat_id match first
+        result = self._pending.pop((chat_id, token), None)
+        if result:
+            return result
+        # Global fallback: web panel approves as "admin" but token may belong to another chat_id
+        for key in list(self._pending):
+            if key[1] == token:
+                return self._pending.pop(key, None)
+        return None

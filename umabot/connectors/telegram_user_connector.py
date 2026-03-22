@@ -8,9 +8,11 @@ import logging
 import os
 from typing import Optional
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, WSMsgType
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+
+from umabot.connectors.telegram_format import markdown_to_telegram_html, split_message
 import qrcode
 
 from umabot.config import load_config
@@ -113,8 +115,12 @@ class TelegramUserConnector(BaseConnector):
                         self._connected = True
                         logger.info(f"Telegram User connector {self.name} ready")
 
-                        # Run until disconnected
-                        await client.run_until_disconnected()
+                        # Run recv loop (outbound sends) alongside Telethon client
+                        recv_task = asyncio.create_task(self._recv_loop(ws, client))
+                        try:
+                            await client.run_until_disconnected()
+                        finally:
+                            recv_task.cancel()
                 except asyncio.CancelledError:
                     raise
                 except SystemExit:
@@ -156,6 +162,41 @@ class TelegramUserConnector(BaseConnector):
         from datetime import datetime
 
         self._last_message_at = datetime.utcnow().isoformat()
+
+    async def _recv_loop(self, ws, client: TelegramClient) -> None:
+        """Receive send commands from gateway and send via Telethon."""
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    data = msg.json()
+                    if data.get("type") == "send":
+                        chat_id = data.get("chat_id", "")
+                        text = data.get("text", "")
+                        await self._send_message(client, chat_id, text)
+                elif msg.type in {WSMsgType.CLOSE, WSMsgType.ERROR}:
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    async def _send_message(self, client: TelegramClient, chat_id: str, text: str) -> None:
+        """Send formatted message via Telethon."""
+        if not chat_id:
+            return
+
+        html_text = markdown_to_telegram_html(text)
+        chunks = split_message(html_text)
+
+        for chunk in chunks:
+            try:
+                await client.send_message(int(chat_id), chunk, parse_mode="html")
+                logger.debug("Sent Telethon message")
+            except Exception:
+                # Fallback: send without formatting
+                try:
+                    await client.send_message(int(chat_id), chunk)
+                    logger.debug("Sent Telethon message (plain fallback)")
+                except Exception as exc:
+                    logger.error("Failed to send Telethon message: %s", exc)
 
     async def health_check(self) -> ConnectorStatus:
         """Return current health status."""

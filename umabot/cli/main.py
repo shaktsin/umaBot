@@ -103,14 +103,8 @@ def main() -> None:
     skills_uninstall_parser = skills_subparsers.add_parser("uninstall", help="Uninstall skill")
     skills_uninstall_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
     skills_uninstall_parser.add_argument("name")
-    skills_reinstall_parser = skills_subparsers.add_parser("reinstall", help="Rebuild skill runtime for an installed skill")
-    skills_reinstall_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
-    skills_reinstall_parser.add_argument("name")
     skills_lint_parser = skills_subparsers.add_parser("lint", help="Lint all skills")
     skills_lint_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
-    skills_configure_parser = skills_subparsers.add_parser("configure", help="Configure installed skill")
-    skills_configure_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
-    skills_configure_parser.add_argument("name")
 
     # Task management
     tasks_parser = subparsers.add_parser("tasks", help="Manage scheduled tasks")
@@ -132,6 +126,14 @@ def main() -> None:
     tasks_cancel_parser = tasks_subparsers.add_parser("cancel", help="Cancel task")
     tasks_cancel_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
     tasks_cancel_parser.add_argument("id", type=int)
+
+    # Web control panel
+    panel_parser = subparsers.add_parser("panel", help="Start local web control panel (http://127.0.0.1:8080)")
+    panel_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
+    panel_parser.add_argument("--host", dest="host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    panel_parser.add_argument("--port", dest="port", type=int, default=8080, help="Bind port (default: 8080)")
+    panel_parser.add_argument("--no-open", dest="no_open", action="store_true", help="Don't open browser automatically")
+    panel_parser.add_argument("--log-level", dest="log_level", default=None, help="Logging level")
 
     # Control panel management
     control_panel_parser = subparsers.add_parser("control-panel", help="Manage control panel")
@@ -217,6 +219,17 @@ def main() -> None:
         from umabot.cli.tasks import handle_tasks
 
         handle_tasks(args)
+
+    elif args.command == "panel":
+        from umabot.cli.panel import run_panel
+
+        run_panel(
+            config_path=args.config,
+            host=args.host,
+            port=args.port,
+            no_open=args.no_open,
+            log_level=args.log_level,
+        )
 
     elif args.command == "control-panel":
         from umabot.cli.control_panel_setup import run_setup

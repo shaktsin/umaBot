@@ -1,17 +1,13 @@
-"""Unified tool registry managing built-in tools, skills, and MCP servers."""
+"""Unified tool registry managing built-in tools and MCP servers."""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import Any, Dict, Optional
 
 from .registry import Tool, ToolResult
-
-if TYPE_CHECKING:
-    from umabot.skills.registry import SkillRegistry
-    from umabot.skills.runtime import SkillRuntime
 
 logger = logging.getLogger("umabot.tools.unified")
 
@@ -19,7 +15,6 @@ logger = logging.getLogger("umabot.tools.unified")
 class ToolSource(Enum):
     """Source of a tool."""
     BUILTIN = "builtin"
-    SKILL = "skill"
     MCP = "mcp"
 
 
@@ -34,13 +29,11 @@ class ToolInfo:
 
 
 class UnifiedToolRegistry:
-    """Single registry for all tool types (built-in, skills, MCP)."""
+    """Single registry for all tool types (built-in, MCP)."""
 
     def __init__(self):
         self._builtin_tools: Dict[str, Tool] = {}
-        self._skill_registry: Optional[SkillRegistry] = None
-        self._skill_runtime: Optional[SkillRuntime] = None
-        self._mcp_registry: Optional[Any] = None  # Will be MCPRegistry when implemented
+        self._mcp_registry: Optional[Any] = None
 
     # ==================== Built-in Tools ====================
 
@@ -54,18 +47,6 @@ class UnifiedToolRegistry:
         if name in self._builtin_tools:
             self._builtin_tools.pop(name)
             logger.debug(f"Unregistered built-in tool: {name}")
-
-    # ==================== Skills ====================
-
-    def set_skill_registry(self, registry: SkillRegistry):
-        """Connect skill registry."""
-        self._skill_registry = registry
-        logger.debug("Connected skill registry")
-
-    def set_skill_runtime(self, runtime: SkillRuntime):
-        """Connect skill runtime."""
-        self._skill_runtime = runtime
-        logger.debug("Connected skill runtime")
 
     # ==================== MCP ====================
 
@@ -92,13 +73,7 @@ class UnifiedToolRegistry:
                 }
             )
 
-        # 2. Skill tools (dynamic)
-        if self._skill_registry:
-            skill_tools = self._build_skill_tools()
-            for name, info in skill_tools.items():
-                tools[name] = info
-
-        # 3. MCP tools
+        # 2. MCP tools
         if self._mcp_registry:
             try:
                 mcp_tools = self._mcp_registry.get_all_tools()
@@ -118,32 +93,6 @@ class UnifiedToolRegistry:
 
         return tools
 
-    def _build_skill_tools(self) -> Dict[str, ToolInfo]:
-        """Build tool definitions from skills."""
-        tools = {}
-
-        if not self._skill_registry:
-            return tools
-
-        for skill in self._skill_registry.list():
-            for script_name, script_spec in skill.metadata.scripts.items():
-                # Generate tool name: skill_{skill_name}_{script_name}
-                tool_name = f"skill_{skill.metadata.name}_{script_name}"
-
-                tools[tool_name] = ToolInfo(
-                    name=tool_name,
-                    source=ToolSource.SKILL,
-                    description=script_spec.get("description", ""),
-                    schema=script_spec.get("input_schema", {}),
-                    metadata={
-                        "skill": skill.metadata.name,
-                        "script": script_name,
-                        "risk_level": skill.metadata.risk_level
-                    }
-                )
-
-        return tools
-
     async def execute_tool(self, name: str, arguments: dict) -> ToolResult:
         """Execute any tool by name."""
         # 1. Built-in tool?
@@ -153,34 +102,7 @@ class UnifiedToolRegistry:
             result = await tool.handler(arguments)
             return result
 
-        # 2. Skill tool?
-        if name.startswith("skill_"):
-            if not self._skill_runtime:
-                raise ValueError("Skill runtime not configured")
-
-            # Parse: skill_{skill_name}_{script_name}
-            parts = name.split("_", 2)
-            if len(parts) < 3:
-                raise ValueError(f"Invalid skill tool name: {name}")
-
-            skill_name = parts[1]
-            script_name = parts[2]
-
-            logger.debug(f"Executing skill: {skill_name}.{script_name}")
-
-            skill_result = await self._skill_runtime.run_script(
-                skill_name=skill_name,
-                script=script_name,
-                payload=arguments
-            )
-
-            # Convert SkillRunResult to ToolResult
-            return ToolResult(
-                content=skill_result.output,
-                data=skill_result.data
-            )
-
-        # 3. MCP tool?
+        # 2. MCP tool?
         if name.startswith("mcp_"):
             if not self._mcp_registry:
                 raise ValueError("MCP not configured")
@@ -206,8 +128,6 @@ class UnifiedToolRegistry:
         """Determine source of a tool."""
         if name in self._builtin_tools:
             return ToolSource.BUILTIN
-        elif name.startswith("skill_"):
-            return ToolSource.SKILL
         elif name.startswith("mcp_"):
             return ToolSource.MCP
         return None

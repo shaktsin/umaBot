@@ -14,10 +14,9 @@ from umabot.models import IncomingMessage
 from umabot.policy import PolicyEngine
 from umabot.router import ControlConfig, MessageRouter
 from umabot.scheduler import TaskScheduler
-from umabot.skills import SkillRegistry
-from umabot.skills.runtime import SkillRuntime
+from umabot.skills import SkillRegistry, SkillRuntimeProvisioner
 from umabot.storage import Database, Queue
-from umabot.tools import ToolRegistry, UnifiedToolRegistry, register_builtin_tools, register_skill_tools
+from umabot.tools import ToolRegistry, UnifiedToolRegistry, register_builtin_tools
 from umabot.worker import Worker
 from umabot.ws import ChannelHub, WebsocketGateway
 
@@ -141,6 +140,10 @@ class Gateway:
         """Send message to control panel, with fallback to original channel."""
         # Try new control panel first
         if self._control_panel.config.enabled:
+            # Web panel: route directly through the hub to the web-panel connector
+            if self._control_panel.config.ui_type == "web":
+                await self.send_message("web", "admin", text, connector="web-panel")
+                return
             await self._control_panel.send_notification(text)
             return
 
@@ -174,6 +177,7 @@ class Gateway:
                     "pending": {
                         "chat_id": pending.chat_id,
                         "channel": pending.channel,
+                        "connector": pending.connector,
                         "session_id": pending.session_id,
                         "message_id": pending.message_id,
                         "tool_call": pending.tool_call,
@@ -228,6 +232,7 @@ class Gateway:
                     "pending": {
                         "chat_id": pending.chat_id,
                         "channel": pending.channel,
+                        "connector": pending.connector,
                         "session_id": pending.session_id,
                         "message_id": pending.message_id,
                         "tool_call": pending.tool_call,
@@ -285,40 +290,35 @@ class Gateway:
             self._ws_gateway = None
 
 
-def build_runtime(config_path: Optional[str] = None, overrides: Optional[Dict[str, str]] = None):
-    config, resolved_path = load_config(config_path=config_path, overrides=overrides)
-    db = Database(config.storage.db_path)
-    queue = Queue(db)
-    skill_registry = SkillRegistry()
-    skill_registry.load_from_dirs([
+def _skill_dirs(config) -> list[Path]:
+    """Build list of skill directories from defaults + config."""
+    dirs = [
         Path.cwd() / "skills",
         Path.home() / ".umabot" / "skills",
-    ])
+    ]
+    for extra in getattr(config, "skill_dirs", []) or []:
+        dirs.append(Path(extra).expanduser())
+    return dirs
 
-    # Create skill runtime
-    skill_runtime = SkillRuntime(skill_registry=skill_registry, config=config)
 
-    # Legacy tool registry (for PolicyEngine compatibility)
+def build_runtime(config_path: Optional[str] = None, overrides: Optional[Dict[str, str]] = None):
+    config, resolved_path = load_config(config_path=config_path, overrides=overrides)
+    _apply_worker_path(config)
+    db = Database(config.storage.db_path)
+    queue = Queue(db)
+    provisioner = SkillRuntimeProvisioner(config.skills)
+    skill_registry = SkillRegistry(provisioner=provisioner)
+    skill_registry.load_from_dirs(_skill_dirs(config))
+
     tool_registry = ToolRegistry()
     register_builtin_tools(
         tool_registry,
         enable_shell=config.tools.shell_enabled,
     )
-    register_skill_tools(
-        tool_registry,
-        runtime=skill_runtime,
-    )
 
-    # New unified tool registry
     unified_registry = UnifiedToolRegistry()
-
-    # Register built-in tools
     for tool in tool_registry.list().values():
         unified_registry.register_builtin(tool)
-
-    # Connect skill system
-    unified_registry.set_skill_registry(skill_registry)
-    unified_registry.set_skill_runtime(skill_runtime)
 
     policy = PolicyEngine(tool_registry, strictness=config.policy.confirmation_strictness)
     return config, resolved_path, db, queue, tool_registry, policy, skill_registry, unified_registry
@@ -326,39 +326,53 @@ def build_runtime(config_path: Optional[str] = None, overrides: Optional[Dict[st
 
 def _reload_runtime(config_path: str, overrides: Optional[Dict[str, str]] = None):
     config, resolved_path = load_config(config_path=config_path, overrides=overrides)
-    skill_registry = SkillRegistry()
-    skill_registry.load_from_dirs([
-        Path.cwd() / "skills",
-        Path.home() / ".umabot" / "skills",
-    ])
+    _apply_worker_path(config)
+    provisioner = SkillRuntimeProvisioner(config.skills)
+    skill_registry = SkillRegistry(provisioner=provisioner)
+    skill_registry.load_from_dirs(_skill_dirs(config))
 
-    # Create skill runtime
-    skill_runtime = SkillRuntime(skill_registry=skill_registry, config=config)
-
-    # Legacy tool registry (for PolicyEngine compatibility)
     tool_registry = ToolRegistry()
     register_builtin_tools(
         tool_registry,
         enable_shell=config.tools.shell_enabled,
     )
-    register_skill_tools(
-        tool_registry,
-        runtime=skill_runtime,
-    )
 
-    # New unified tool registry
     unified_registry = UnifiedToolRegistry()
-
-    # Register built-in tools
     for tool in tool_registry.list().values():
         unified_registry.register_builtin(tool)
 
-    # Connect skill system
-    unified_registry.set_skill_registry(skill_registry)
-    unified_registry.set_skill_runtime(skill_runtime)
-
     policy = PolicyEngine(tool_registry, strictness=config.policy.confirmation_strictness)
     return config, resolved_path, tool_registry, policy, skill_registry, unified_registry
+
+
+def _apply_worker_path(config) -> None:
+    """Prepend skills.defaults node_bin and extra_path to os.environ['PATH'].
+
+    This is the global fallback — ensures node/custom tools are on PATH for any
+    shell.run call that fires outside an active skill context.  Per-skill env is
+    handled separately by the ContextVar in builtin.py.
+    """
+    import os
+    defaults = getattr(getattr(config, "skills", None), "defaults", None)
+    if not defaults:
+        return
+
+    dirs_to_prepend: list[str] = []
+    for p in defaults.extra_path:
+        if p and p not in dirs_to_prepend:
+            dirs_to_prepend.append(p)
+    if defaults.node_bin and defaults.node_bin not in dirs_to_prepend:
+        dirs_to_prepend.append(defaults.node_bin)
+
+    if not dirs_to_prepend:
+        return
+
+    current_path = os.environ.get("PATH", "")
+    existing = set(current_path.split(os.pathsep))
+    new_dirs = [d for d in dirs_to_prepend if d not in existing]
+    if new_dirs:
+        os.environ["PATH"] = os.pathsep.join(new_dirs) + os.pathsep + current_path
+        logger.info("PATH extended with: %s", new_dirs)
 
 
 def main() -> None:
