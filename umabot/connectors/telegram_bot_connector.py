@@ -107,10 +107,18 @@ class TelegramBotConnector(BaseConnector):
                 await asyncio.sleep(2)
                 continue
 
+            from datetime import datetime
+
             for update in data.get("result", []) or []:
                 self._offset = update.get("update_id", 0) + 1
-                message = update.get("message") or update.get("edited_message")
 
+                # Handle inline keyboard button presses (approval flow)
+                callback = update.get("callback_query")
+                if callback:
+                    await self._handle_callback_query(ws, callback)
+                    continue
+
+                message = update.get("message") or update.get("edited_message")
                 if not message or "text" not in message:
                     continue
 
@@ -128,23 +136,103 @@ class TelegramBotConnector(BaseConnector):
                     }
                 )
 
-                from datetime import datetime
-
                 self._last_message_at = datetime.utcnow().isoformat()
                 logger.debug("Forwarded Telegram message to gateway")
+
+    async def _handle_callback_query(self, ws, callback: Dict[str, Any]) -> None:
+        """Handle an inline keyboard button press for tool approval."""
+        callback_id = callback.get("id", "")
+        chat_id = str(callback.get("message", {}).get("chat", {}).get("id", ""))
+        user_id = str(callback.get("from", {}).get("id", ""))
+        data = callback.get("data", "")
+
+        # Expected format: "confirm:YES:<token>" or "confirm:NO:<token>"
+        if not data.startswith("confirm:"):
+            return
+
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            return
+        _, verdict, token = parts
+        verdict = verdict.upper()
+
+        # Acknowledge the button press immediately (removes the loading spinner)
+        try:
+            await asyncio.to_thread(
+                self._post,
+                "answerCallbackQuery",
+                {"callback_query_id": callback_id},
+            )
+        except Exception as exc:
+            logger.warning("answerCallbackQuery failed: %s", exc)
+
+        # Forward as a regular text event — policy engine handles "YES <token>"
+        await ws.send_json(
+            {
+                "type": "event",
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "text": f"{verdict} {token}",
+            }
+        )
+        logger.debug("Forwarded callback approval chat_id=%s verdict=%s", chat_id, verdict)
 
     async def _recv_loop(self, ws) -> None:
         """Receive send commands from gateway."""
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 data = json.loads(msg.data)
-                if data.get("type") == "send":
-                    chat_id = data.get("chat_id", "")
-                    text = data.get("text", "")
-                    await self._send_message(chat_id, text)
+                msg_type = data.get("type")
+                chat_id = data.get("chat_id", "")
+                if msg_type == "send":
+                    await self._send_message(chat_id, data.get("text", ""))
+                elif msg_type == "confirm_request":
+                    await self._send_confirmation_request(
+                        chat_id,
+                        tool_name=data.get("tool_name", "unknown"),
+                        args_preview=data.get("args_preview", ""),
+                        token=data.get("token", ""),
+                    )
             elif msg.type in {WSMsgType.CLOSE, WSMsgType.ERROR}:
                 logger.warning("WebSocket closed or error")
                 break
+
+    async def _send_confirmation_request(
+        self, chat_id: str, tool_name: str, args_preview: str, token: str
+    ) -> None:
+        """Send a tool approval request with Approve/Deny inline keyboard buttons."""
+        if not chat_id:
+            return
+        text = f"⚠️ <b>Approval required</b>\nTool: <code>{tool_name}</code>"
+        if args_preview:
+            # Trim to keep the message readable
+            preview = args_preview[:300] + ("..." if len(args_preview) > 300 else "")
+            text += f"\n\nArguments:\n<pre>{preview}</pre>"
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve", "callback_data": f"confirm:YES:{token}"},
+                    {"text": "❌ Deny",    "callback_data": f"confirm:NO:{token}"},
+                ]
+            ]
+        }
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": json.dumps(keyboard),
+        }
+        try:
+            await asyncio.to_thread(self._post, "sendMessage", payload)
+            logger.debug("Sent confirmation request with inline keyboard chat_id=%s tool=%s", chat_id, tool_name)
+        except Exception as exc:
+            logger.error("Failed to send confirmation request: %s", exc)
+            # Fallback: plain text without buttons
+            await self._send_message(
+                chat_id,
+                f"⚠️ Approval required: {tool_name}\n\nReply YES to approve or NO to deny.",
+            )
 
     async def _send_message(self, chat_id: str, text: str) -> None:
         """Send message to Telegram chat with formatting."""
