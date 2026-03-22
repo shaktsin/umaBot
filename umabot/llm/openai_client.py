@@ -1,28 +1,54 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .base import LLMClient, LLMResponse, ToolCall
 
+if TYPE_CHECKING:
+    from .rate_limiter import TokenBucket
+
+_REASONING_MODELS = ("o1", "o3", "o4")
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """Return True for OpenAI o-series reasoning models."""
+    name = model.lower()
+    return any(name == prefix or name.startswith(prefix + "-") for prefix in _REASONING_MODELS)
+
 
 class OpenAIClient(LLMClient):
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        reasoning_effort: Optional[str] = None,
+        rate_limiter: Optional["TokenBucket"] = None,
+    ) -> None:
+        super().__init__(rate_limiter=rate_limiter)
         self.api_key = api_key
         self.model = model
+        self.reasoning_effort = reasoning_effort
 
     async def generate(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> LLMResponse:
+        await self._throttle(messages, tools)
+
         name_map: Dict[str, str] = {}
         reverse_map: Dict[str, str] = {}
-        safe_messages = _sanitize_messages_for_openai(messages, name_map, reverse_map)
+        is_reasoning = _is_reasoning_model(self.model)
+        safe_messages = _sanitize_messages_for_openai(
+            messages, name_map, reverse_map, convert_system_role=is_reasoning
+        )
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": safe_messages,
         }
+        if is_reasoning and self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         if tools:
             safe_tools = []
             for tool in tools:
@@ -32,7 +58,8 @@ class OpenAIClient(LLMClient):
                 safe_tool["name"] = safe_name
                 safe_tools.append({"type": "function", "function": safe_tool})
             payload["tools"] = safe_tools
-        data = await self._post_json(
+
+        data = await self._http_post(
             "https://api.openai.com/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -40,12 +67,12 @@ class OpenAIClient(LLMClient):
             },
             payload=payload,
         )
+
         message = data["choices"][0]["message"]
         content = message.get("content") or ""
         tool_calls = []
         for call in message.get("tool_calls", []) or []:
             fn = call.get("function", {})
-            args = {}
             try:
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:
@@ -67,10 +94,13 @@ def _sanitize_messages_for_openai(
     messages: List[Dict[str, Any]],
     name_map: Dict[str, str],
     reverse_map: Dict[str, str],
+    convert_system_role: bool = False,
 ) -> List[Dict[str, Any]]:
     safe_messages: List[Dict[str, Any]] = []
     for message in messages:
         safe_message = dict(message)
+        if convert_system_role and safe_message.get("role") == "system":
+            safe_message["role"] = "developer"
 
         tool_calls = safe_message.get("tool_calls")
         if isinstance(tool_calls, list):

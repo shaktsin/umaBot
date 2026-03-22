@@ -1,4 +1,4 @@
-.PHONY: help install dev-install clean test lint format run run-debug start stop status reload skills doctor setup
+.PHONY: help install dev-install panel-install clean test lint format run run-debug start stop status reload skills doctor setup panel panel-build panel-dev
 
 # Default Python
 PYTHON := python3
@@ -49,8 +49,10 @@ install: ## Install UmaBot (create venv, install deps)
 	@echo "$(GREEN)✓ Installation complete!$(NC)"
 	@echo ""
 	@echo "$(BLUE)Next steps:$(NC)"
-	@echo "  1. Configure UmaBot (includes control panel):  $(YELLOW)make init$(NC)"
-	@echo "  2. Run in foreground:                         $(YELLOW)make run$(NC)"
+	@echo "  1. Configure UmaBot:          $(YELLOW)make init$(NC)"
+	@echo "  2. Install panel deps:        $(YELLOW)make panel-install$(NC)"
+	@echo "  3. Build frontend:            $(YELLOW)make panel-build$(NC)"
+	@echo "  4. Run everything:            $(YELLOW)make run$(NC)"
 	@echo ""
 	@echo "$(GREEN)Config will be saved to: $(CONFIG_FILE)$(NC)"
 
@@ -83,19 +85,64 @@ doctor: install ## Run system diagnostics
 
 ##@ Running
 
-run: install ## Run UmaBot in foreground (development)
+run: install ## Run UmaBot in foreground (gateway + connectors + panel if configured)
 	@echo "$(BLUE)Starting UmaBot in foreground...$(NC)"
 	@echo "$(YELLOW)Press Ctrl+C to stop$(NC)"
-	@$(UMABOT) orchestrate --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
+	@( \
+		PANEL_PID=""; \
+		if grep -q "ui_type: web" $(CONFIG_FILE) 2>/dev/null && grep -q "enabled: true" $(CONFIG_FILE) 2>/dev/null; then \
+			PORT=$$(grep 'web_port' $(CONFIG_FILE) 2>/dev/null | awk '{print $$2}' | head -1); \
+			PORT=$${PORT:-8080}; \
+			$(BIN)/python -m umabot.controlpanel --config $(CONFIG_FILE) --no-open --log-level $(LOG_LEVEL) & \
+			PANEL_PID=$$!; \
+			echo "$(GREEN)✓ Control panel starting → http://127.0.0.1:$$PORT$(NC)"; \
+		fi; \
+		cleanup() { [ -n "$$PANEL_PID" ] && kill "$$PANEL_PID" 2>/dev/null; }; \
+		trap cleanup EXIT INT TERM; \
+		$(UMABOT) orchestrate --config $(CONFIG_FILE) --log-level $(LOG_LEVEL); \
+	)
 
 run-debug: install ## Run in foreground with DEBUG logging
 	@echo "$(BLUE)Starting UmaBot in DEBUG mode...$(NC)"
 	@echo "$(YELLOW)Press Ctrl+C to stop$(NC)"
-	@$(UMABOT) orchestrate --config $(CONFIG_FILE) --log-level DEBUG
+	@( \
+		PANEL_PID=""; \
+		if grep -q "ui_type: web" $(CONFIG_FILE) 2>/dev/null && grep -q "enabled: true" $(CONFIG_FILE) 2>/dev/null; then \
+			PORT=$$(grep 'web_port' $(CONFIG_FILE) 2>/dev/null | awk '{print $$2}' | head -1); \
+			PORT=$${PORT:-8080}; \
+			$(BIN)/python -m umabot.controlpanel --config $(CONFIG_FILE) --no-open --log-level DEBUG & \
+			PANEL_PID=$$!; \
+			echo "$(GREEN)✓ Control panel starting → http://127.0.0.1:$$PORT$(NC)"; \
+		fi; \
+		cleanup() { [ -n "$$PANEL_PID" ] && kill "$$PANEL_PID" 2>/dev/null; }; \
+		trap cleanup EXIT INT TERM; \
+		$(UMABOT) orchestrate --config $(CONFIG_FILE) --log-level DEBUG; \
+	)
 
 run-gateway: install ## Run only gateway (no connectors)
 	@echo "$(BLUE)Starting gateway only...$(NC)"
 	@$(BIN)/python -m umabot.gateway --config $(CONFIG_FILE) --log-level DEBUG
+
+##@ Control Panel
+
+panel-install: ## Install control panel dependencies (fastapi + uvicorn)
+	@echo "$(BLUE)Installing control panel dependencies...$(NC)"
+	@$(PIP) install -e ".[panel]"
+	@echo "$(GREEN)✓ Panel dependencies installed$(NC)"
+
+panel: panel-install ## Start the web control panel (opens browser)
+	@echo "$(BLUE)Starting control panel...$(NC)"
+	@$(UMABOT) panel --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
+
+panel-build: ## Build the frontend (outputs to umabot/controlpanel/static/)
+	@echo "$(BLUE)Building control panel frontend...$(NC)"
+	@cd umabot/controlpanel/frontend && npm install && npm run build
+	@echo "$(GREEN)✓ Frontend built → umabot/controlpanel/static/$(NC)"
+
+panel-dev: ## Start frontend dev server with HMR (requires gateway + panel running separately)
+	@echo "$(BLUE)Starting frontend dev server on http://localhost:5173$(NC)"
+	@echo "$(YELLOW)Make sure 'make run' or 'make panel' is running on port 8080$(NC)"
+	@cd umabot/controlpanel/frontend && npm run dev
 
 ##@ Daemon Management
 
@@ -105,9 +152,37 @@ start: install ## Start UmaBot daemon
 	@sleep 1
 	@$(MAKE) status
 
-stop: ## Stop UmaBot daemon
-	@echo "$(YELLOW)Stopping UmaBot daemon...$(NC)"
-	@$(UMABOT) stop --config $(CONFIG_FILE) || true
+stop: ## Stop all UmaBot processes (daemon PID file + any foreground make run/start processes)
+	@echo "$(YELLOW)Stopping UmaBot...$(NC)"
+	@# 1. Daemon mode: kill via PID file written by `make start`
+	@PID_FILE="$(CONFIG_DIR)/umabot.pid"; \
+	if [ -f "$$PID_FILE" ]; then \
+		PID=$$(cat "$$PID_FILE" 2>/dev/null); \
+		if [ -n "$$PID" ] && kill -0 "$$PID" 2>/dev/null; then \
+			echo "  $(YELLOW)Stopping daemon PID=$$PID$(NC)"; \
+			kill -TERM "$$PID" 2>/dev/null || true; \
+		fi; \
+		rm -f "$$PID_FILE"; \
+	fi
+	@# 2. Foreground mode: kill processes started by `make run` / `make run-debug`
+	@#    Patterns match: `umabot orchestrate`, `umabot.controlpanel`, `umabot.gateway`
+	@for pat in "umabot orchestrate" "umabot.controlpanel" "umabot.gateway"; do \
+		pids=$$(pgrep -f "$$pat" 2>/dev/null); \
+		if [ -n "$$pids" ]; then \
+			echo "  $(YELLOW)Stopping $$pat (PID $$pids)$(NC)"; \
+			kill -TERM $$pids 2>/dev/null || true; \
+		fi; \
+	done
+	@# 3. Give processes a moment to exit gracefully, then force-kill stragglers
+	@sleep 1
+	@for pat in "umabot orchestrate" "umabot.controlpanel" "umabot.gateway"; do \
+		pids=$$(pgrep -f "$$pat" 2>/dev/null); \
+		if [ -n "$$pids" ]; then \
+			echo "  $(RED)Force-killing $$pat (PID $$pids)$(NC)"; \
+			kill -KILL $$pids 2>/dev/null || true; \
+		fi; \
+	done
+	@echo "$(GREEN)✓ All UmaBot processes stopped$(NC)"
 
 restart: stop start ## Restart UmaBot daemon
 

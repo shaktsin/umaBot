@@ -13,6 +13,8 @@ from urllib.request import Request, urlopen
 
 from aiohttp import ClientSession, WSMsgType
 
+from umabot.connectors.telegram_format import markdown_to_telegram_html, split_message
+
 from umabot.config import load_config
 from umabot.connectors.base import BaseConnector, ConnectorStatus
 
@@ -145,16 +147,26 @@ class TelegramBotConnector(BaseConnector):
                 break
 
     async def _send_message(self, chat_id: str, text: str) -> None:
-        """Send message to Telegram chat."""
+        """Send message to Telegram chat with formatting."""
         if not chat_id:
             return
 
-        payload = {"chat_id": chat_id, "text": text}
-        try:
-            await asyncio.to_thread(self._post, "sendMessage", payload)
-            logger.debug("Sent Telegram message")
-        except Exception as exc:
-            logger.error("Failed to send Telegram message: %s", exc)
+        html_text = markdown_to_telegram_html(text)
+        chunks = split_message(html_text)
+
+        for chunk in chunks:
+            payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"}
+            try:
+                await asyncio.to_thread(self._post, "sendMessage", payload)
+                logger.debug("Sent Telegram message")
+            except Exception:
+                # Fallback: send without parse_mode in case HTML is malformed
+                fallback_payload = {"chat_id": chat_id, "text": chunk}
+                try:
+                    await asyncio.to_thread(self._post, "sendMessage", fallback_payload)
+                    logger.debug("Sent Telegram message (plain fallback)")
+                except Exception as exc:
+                    logger.error("Failed to send Telegram message: %s", exc)
 
     def _get(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Make GET request to Telegram Bot API."""

@@ -22,6 +22,7 @@ from umabot.config.schema import (
     LLMConfig,
     default_config,
 )
+from umabot.llm.openai_client import _is_reasoning_model
 from umabot.config.loader import save_config as save_cfg, store_secrets
 from umabot.storage import Database
 
@@ -98,6 +99,20 @@ def run_wizard(
     model = questionary.select(f"Select {provider} model:", choices=models).ask()
     cfg.llm.model = model
 
+    # Reasoning effort for OpenAI o-series models
+    if provider == "openai" and _is_reasoning_model(model):
+        effort = questionary.select(
+            "Reasoning effort (higher = smarter but slower and more expensive):",
+            choices=[
+                Choice("High — best quality, follows complex instructions carefully", value="high"),
+                Choice("Medium — balanced speed and quality (recommended)", value="medium"),
+                Choice("Low — fastest, cheapest, good for simple tasks", value="low"),
+            ],
+            default="medium",
+        ).ask()
+        cfg.llm.reasoning_effort = effort
+        console.print(f"[green]✓ Reasoning effort set to: {effort}[/green]")
+
     api_key = _prompt_required_secret(f"Enter {provider} API key:")
     cfg.llm.api_key = api_key
 
@@ -117,10 +132,10 @@ def run_wizard(
         ui_type = questionary.select(
             "Choose control panel UI type:",
             choices=[
+                Choice("Web UI (local browser) — recommended", value="web"),
                 Choice("Telegram Bot (remote messaging)", value="telegram"),
                 Choice("Discord Bot (remote messaging)", value="discord"),
                 Choice("CLI Chat (local terminal) [Coming Soon]", value="cli"),
-                Choice("Web UI (local browser) [Coming Soon]", value="web"),
                 Choice("Skip for now", value="none"),
             ],
         ).ask()
@@ -177,8 +192,28 @@ def run_wizard(
             )
             console.print("[green]✓ Control panel configured via Discord[/green]")
 
-        elif ui_type in ("cli", "web"):
-            console.print(f"[yellow]✓ {ui_type.upper()} control panel will be available in future release[/yellow]")
+        elif ui_type == "web":
+            console.print("\n[cyan]━━━ Web Control Panel Setup ━━━[/cyan]\n")
+            port_str = questionary.text(
+                "Port for the web panel (default: 8080):",
+                default="8080",
+            ).ask()
+            try:
+                port = int(port_str or "8080")
+            except ValueError:
+                port = 8080
+
+            cfg.control_panel.enabled = True
+            cfg.control_panel.ui_type = "web"
+            cfg.control_panel.web_host = "127.0.0.1"
+            cfg.control_panel.web_port = port
+            console.print(
+                f"[green]✓ Web control panel configured at http://127.0.0.1:{port}[/green]\n"
+                f"  [dim]Starts automatically with [bold]umabot start[/bold][/dim]"
+            )
+
+        elif ui_type == "cli":
+            console.print("[yellow]CLI control panel coming in a future release.[/yellow]")
             cfg.control_panel.enabled = False
 
     # Step 3: Message Connectors
@@ -219,12 +254,20 @@ def run_wizard(
     save_cfg(cfg, str(config_file))
     store_secrets(api_key=api_key, telegram_token=telegram_token, discord_token=discord_token)
 
+    panel_hint = ""
+    if cfg.control_panel.enabled and cfg.control_panel.ui_type == "web":
+        panel_hint = (
+            f"\n  • Control panel: [link]http://127.0.0.1:{cfg.control_panel.web_port}[/link]"
+            " (starts with daemon)"
+        )
+
     console.print(
         Panel.fit(
             f"[bold green]✓ Configuration saved to {config_file}[/bold green]\n\n"
             "Next steps:\n"
             "  • Run [cyan]umabot doctor[/cyan] to verify setup\n"
-            "  • Run [cyan]umabot start[/cyan] to start daemon\n"
+            "  • Run [cyan]umabot start[/cyan] to start daemon"
+            f"{panel_hint}\n"
             "  • Run [cyan]umabot connections[/cyan] to check status",
             border_style="green",
         )
@@ -241,16 +284,19 @@ def _get_models_for_provider(provider: str) -> list:
     """Return available models for a provider."""
     models = {
         "openai": [
-            Choice("GPT-4o (recommended)", value="gpt-4o"),
-            Choice("GPT-4o mini", value="gpt-4o-mini"),
-            Choice("GPT-4 Turbo", value="gpt-4-turbo"),
+            Choice("o3 — reasoning model, best instruction-following (recommended)", value="o3"),
+            Choice("o4-mini — fast reasoning model, great value", value="o4-mini"),
+            Choice("GPT-4o — multimodal, no reasoning", value="gpt-4o"),
+            Choice("GPT-4o mini — fast, cheap, no reasoning", value="gpt-4o-mini"),
+            Choice("o1 — original reasoning model", value="o1"),
         ],
         "claude": [
-            Choice("Claude 3.5 Sonnet", value="claude-3-5-sonnet-20240620"),
-            Choice("Claude 3 Opus", value="claude-3-opus-20240229"),
-            Choice("Claude 3 Haiku", value="claude-3-haiku-20240307"),
+            Choice("Claude Sonnet 4.6 (recommended)", value="claude-sonnet-4-6"),
+            Choice("Claude Opus 4.6", value="claude-opus-4-6"),
+            Choice("Claude Haiku 4.5", value="claude-haiku-4-5-20251001"),
         ],
         "gemini": [
+            Choice("Gemini 2.0 Flash", value="gemini-2.0-flash"),
             Choice("Gemini 1.5 Pro", value="gemini-1.5-pro"),
             Choice("Gemini 1.5 Flash", value="gemini-1.5-flash"),
         ],

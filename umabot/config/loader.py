@@ -11,7 +11,9 @@ from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
-from .schema import Config, default_config
+from dataclasses import asdict
+
+from .schema import Config, SkillRuntimeOverride, SkillsConfig, default_config
 
 
 logger = logging.getLogger("umabot.config")
@@ -102,6 +104,11 @@ def save_config(cfg: Config, path: str) -> None:
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     data = cfg.to_dict()
+    # Rebuild skills block to include dynamic per-skill entries
+    skills_data: Dict[str, Any] = {"defaults": asdict(cfg.skills.defaults)}
+    for skill_name, override in cfg.skills.iter_skill_overrides():
+        skills_data[skill_name] = asdict(override)
+    data["skills"] = skills_data
     _strip_secrets(data)
     target.write_text(yaml.safe_dump(data, sort_keys=False))
 
@@ -279,6 +286,12 @@ def _apply_overrides(cfg: Config, overrides: Dict[str, Any]) -> None:
 
 
 def _update_dataclass(dc: Any, data: Dict[str, Any]) -> None:
+    # SkillsConfig needs special handling: any key that is not a known field
+    # is treated as a per-skill override block keyed by skill name.
+    if isinstance(dc, SkillsConfig):
+        _update_skills_config(dc, data)
+        return
+
     for key, value in data.items():
         if not hasattr(dc, key):
             continue
@@ -287,6 +300,38 @@ def _update_dataclass(dc: Any, data: Dict[str, Any]) -> None:
             _update_dataclass(current, value)
         else:
             setattr(dc, key, value)
+
+
+def _update_skills_config(cfg: SkillsConfig, data: Dict[str, Any]) -> None:
+    """Parse the skills: block.
+
+    Known top-level key:
+      defaults:  maps to cfg.defaults (a SkillRuntimeOverride)
+
+    Every other key is treated as a skill name whose value is a per-skill
+    SkillRuntimeOverride dict::
+
+        skills:
+          defaults:
+            node_bin: ~/.nvm/versions/node/v24.3.0/bin
+          docx:
+            env:
+              NODE_ENV: production
+          news:
+            env:
+              SERPAPI_API_KEY: my-key
+    """
+    _KNOWN_KEYS = {"defaults"}
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            continue
+        if key == "defaults":
+            _update_dataclass(cfg.defaults, value)
+        elif key not in _KNOWN_KEYS:
+            # Treat as a per-skill override
+            override = SkillRuntimeOverride()
+            _update_dataclass(override, value)
+            cfg.set_skill_override(key, override)
 
 
 def _parse_bool(value: Any) -> bool:

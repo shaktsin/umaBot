@@ -221,3 +221,11 @@ docs/
 
 .staging/
 .tests/
+# Node / frontend tooling (anywhere in the project)
+node_modules/
+package-lock.json
+# Root-level package.json is not part of the project
+/package.json
+
+# Claude Code local settings
+.claude/

@@ -1,138 +1,157 @@
+"""Load and validate Agent Skills (agentskills.io specification)."""
+
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 
 
+# Agent Skills spec: name must be 1-64 chars, lowercase alphanumeric + hyphens,
+# no leading/trailing/consecutive hyphens.
+_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_MAX_NAME_LEN = 64
+_MAX_DESC_LEN = 1024
+
+
+@dataclass
+class SkillRuntimeSpec:
+    """Runtime requirements declared in SKILL.md frontmatter.
+
+    Example SKILL.md:
+        runtime:
+          type: python           # python | node | shell (default: shell)
+          requirements: requirements.txt   # auto-installed into skill-local .venv
+          node_bin: ~/.nvm/versions/node/v20/bin  # overrides global worker.node_bin
+          python_bin: ""         # overrides global worker.python_bin
+          timeout_seconds: 30
+          env:
+            MY_VAR: "value"
+          extra_path:
+            - /usr/local/opt/mytools/bin
+    """
+
+    type: str = "shell"                            # python | node | shell
+    requirements: str = ""                         # relative path to requirements file
+    node_bin: str = ""                             # per-skill node binary dir override
+    python_bin: str = ""                           # per-skill python binary override
+    timeout_seconds: int = 30
+    env: Dict[str, str] = field(default_factory=dict)
+    extra_path: List[str] = field(default_factory=list)
+
+
 @dataclass
 class SkillMetadata:
+    """Metadata parsed from SKILL.md YAML frontmatter (Agent Skills spec)."""
+
     name: str
-    version: str
     description: str
-    allowed_tools: list[str]
-    risk_level: str
-    triggers: list[str]
-    scripts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    install_config: Dict[str, Any] = field(default_factory=dict)
-    runtime: Dict[str, Any] = field(default_factory=dict)
+    license: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    body: str = ""  # Markdown instructions body (after frontmatter)
+    runtime: SkillRuntimeSpec = field(default_factory=SkillRuntimeSpec)
 
 
 def load_skill_metadata(skill_dir: Path) -> Optional[SkillMetadata]:
+    """Load and validate SKILL.md from a skill directory."""
     skill_file = skill_dir / "SKILL.md"
     if not skill_file.exists():
         return None
-    text = skill_file.read_text()
-    data = _parse_frontmatter(text)
-    if not data:
+    text = skill_file.read_text(encoding="utf-8")
+    frontmatter, body = _parse_frontmatter(text)
+    if frontmatter is None:
         return None
-    return _validate_metadata(data)
+    return _validate_metadata(frontmatter, body)
 
 
-def _parse_frontmatter(text: str) -> Optional[Dict[str, Any]]:
-    lines = text.splitlines()
+def _parse_frontmatter(text: str) -> tuple[Optional[Dict[str, Any]], str]:
+    """Parse YAML frontmatter and return (data, body).
+
+    Returns (None, "") if frontmatter is missing or malformed.
+    """
+    lines = text.splitlines(keepends=True)
     if not lines or lines[0].strip() != "---":
-        return None
-    try:
-        end_idx = lines[1:].index("---") + 1
-    except ValueError:
-        return None
-    yaml_block = "\n".join(lines[1:end_idx])
-    return yaml.safe_load(yaml_block) or {}
+        return None, ""
+    # Find closing ---
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return None, ""
+    yaml_block = "".join(lines[1:end_idx])
+    body = "".join(lines[end_idx + 1 :]).strip()
+    data = yaml.safe_load(yaml_block) or {}
+    return data, body
 
 
-def _validate_metadata(data: Dict[str, Any]) -> SkillMetadata:
-    required = ["name", "version", "description", "allowed_tools", "risk_level", "triggers"]
-    for key in required:
-        if key not in data:
-            raise ValueError(f"Missing field: {key}")
-    risk = str(data["risk_level"]).lower()
-    if risk not in {"green", "yellow", "red"}:
-        raise ValueError("Invalid risk_level")
+def _validate_metadata(data: Dict[str, Any], body: str) -> SkillMetadata:
+    """Validate frontmatter against Agent Skills spec."""
+    # Required fields
+    name = str(data.get("name", "")).strip()
+    if not name:
+        raise ValueError("Missing required field: name")
+    if len(name) > _MAX_NAME_LEN:
+        raise ValueError(f"name exceeds {_MAX_NAME_LEN} characters")
+    if not _NAME_RE.match(name) or "--" in name:
+        raise ValueError(
+            f"Invalid name '{name}': must be lowercase alphanumeric + hyphens, "
+            "no leading/trailing/consecutive hyphens"
+        )
+
+    description = str(data.get("description", "")).strip()
+    if not description:
+        raise ValueError("Missing required field: description")
+    if len(description) > _MAX_DESC_LEN:
+        raise ValueError(f"description exceeds {_MAX_DESC_LEN} characters")
+
+    # Optional fields
+    license_str = str(data.get("license", "")).strip()
+    metadata = data.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    # Optional runtime spec
+    runtime_data = data.get("runtime") or {}
+    if not isinstance(runtime_data, dict):
+        runtime_data = {}
+    runtime = _parse_runtime_spec(runtime_data)
+
     return SkillMetadata(
-        name=str(data["name"]),
-        version=str(data["version"]),
-        description=str(data["description"]),
-        allowed_tools=list(data["allowed_tools"] or []),
-        risk_level=risk.upper(),
-        triggers=list(data["triggers"] or []),
-        scripts=_validate_scripts(data.get("scripts")),
-        install_config=_validate_install_config(data.get("install_config")),
-        runtime=_validate_runtime(data.get("runtime")),
+        name=name,
+        description=description,
+        license=license_str,
+        metadata=metadata,
+        body=body,
+        runtime=runtime,
     )
 
 
-def _validate_scripts(raw: Any) -> Dict[str, Dict[str, Any]]:
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise ValueError("scripts must be a mapping")
-    scripts: Dict[str, Dict[str, Any]] = {}
-    for name, script_def in raw.items():
-        script_name = str(name).strip()
-        if isinstance(script_def, dict):
-            script_path = str(script_def.get("path", "")).strip()
-            description = str(script_def.get("description", "")).strip()
-            input_schema = script_def.get("input_schema")
-            arg_mapping = script_def.get("arg_mapping") or {}
-            when = script_def.get("when") or {}
-            examples = script_def.get("examples") or []
-        else:
-            script_path = str(script_def).strip()
-            description = ""
-            input_schema = None
-            arg_mapping = {}
-            when = {}
-            examples = []
-        if not script_name or not script_path:
-            raise ValueError("scripts entries must have non-empty name and path")
-        if Path(script_path).is_absolute() or ".." in Path(script_path).parts:
-            raise ValueError(f"scripts[{script_name}] must be a safe relative path")
-        if input_schema is not None and not isinstance(input_schema, dict):
-            raise ValueError(f"scripts[{script_name}].input_schema must be an object")
-        if not isinstance(arg_mapping, dict):
-            raise ValueError(f"scripts[{script_name}].arg_mapping must be an object")
-        normalized_mapping: Dict[str, list[str]] = {}
-        for target_key, aliases in arg_mapping.items():
-            if isinstance(aliases, list):
-                normalized_mapping[str(target_key)] = [str(a) for a in aliases]
-            else:
-                normalized_mapping[str(target_key)] = [str(aliases)]
-        scripts[script_name] = {
-            "path": script_path,
-            "description": description,
-            "input_schema": input_schema or {},
-            "arg_mapping": normalized_mapping,
-            "when": when if isinstance(when, dict) else {},
-            "examples": examples if isinstance(examples, list) else [],
-        }
-    return scripts
+def _parse_runtime_spec(data: Dict[str, Any]) -> SkillRuntimeSpec:
+    """Parse runtime: section from SKILL.md frontmatter."""
+    env = data.get("env") or {}
+    if not isinstance(env, dict):
+        env = {}
+    extra_path = data.get("extra_path") or []
+    if not isinstance(extra_path, list):
+        extra_path = [str(extra_path)]
 
-
-def _validate_install_config(raw: Any) -> Dict[str, Any]:
-    if raw is None:
-        return {"args": {}, "env": {}}
-    if not isinstance(raw, dict):
-        raise ValueError("install_config must be a mapping")
-    args = raw.get("args", {})
-    env = raw.get("env", {})
-    if not isinstance(args, dict) or not isinstance(env, dict):
-        raise ValueError("install_config.args/env must be mappings")
-    return {"args": args, "env": env}
-
-
-def _validate_runtime(raw: Any) -> Dict[str, Any]:
-    if raw is None:
-        return {"timeout_seconds": 20}
-    if not isinstance(raw, dict):
-        raise ValueError("runtime must be a mapping")
-    timeout = raw.get("timeout_seconds", 20)
+    timeout = data.get("timeout_seconds", 30)
     try:
-        timeout_int = int(timeout)
-    except Exception as exc:
-        raise ValueError("runtime.timeout_seconds must be an integer") from exc
-    if timeout_int <= 0:
-        raise ValueError("runtime.timeout_seconds must be > 0")
-    return {"timeout_seconds": timeout_int}
+        timeout = int(timeout)
+    except (TypeError, ValueError):
+        timeout = 30
+
+    return SkillRuntimeSpec(
+        type=str(data.get("type", "shell")).lower(),
+        requirements=str(data.get("requirements", "")),
+        node_bin=str(data.get("node_bin", "")),
+        python_bin=str(data.get("python_bin", "")),
+        timeout_seconds=timeout,
+        env={str(k): str(v) for k, v in env.items()},
+        extra_path=[str(p) for p in extra_path],
+    )

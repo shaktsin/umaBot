@@ -262,10 +262,11 @@ def _handle_skills(args) -> None:
         registry = SkillRegistry()
         registry.load_from_dirs(base_dirs)
         for skill in registry.list():
-            scripts_count = len(skill.metadata.scripts)
-            print(f"  {skill.metadata.name} ({skill.metadata.version})")
-            print(f"    {skill.metadata.description}")
-            print(f"    Scripts: {scripts_count}")
+            print(f"  {skill.metadata.name}")
+            desc = skill.metadata.description
+            if len(desc) > 100:
+                desc = desc[:100] + "..."
+            print(f"    {desc}")
             print(f"    Path: {skill.path}")
             print()
         return

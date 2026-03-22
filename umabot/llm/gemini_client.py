@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from .base import LLMClient, LLMResponse, ToolCall
+from .base import LLMClient, LLMResponse, ToolCall, _MAX_DELAY
+
+if TYPE_CHECKING:
+    from .rate_limiter import TokenBucket
 
 
 class GeminiClient(LLMClient):
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        rate_limiter: Optional["TokenBucket"] = None,
+    ) -> None:
+        super().__init__(rate_limiter=rate_limiter)
         self.api_key = api_key
         self.model = model
 
@@ -15,6 +24,8 @@ class GeminiClient(LLMClient):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> LLMResponse:
+        await self._throttle(messages, tools)
+
         system_parts = [m["content"] for m in messages if m.get("role") == "system"]
         filtered = [_sanitize_message(m) for m in messages if m.get("role") != "system"]
         contents = [
@@ -40,16 +51,22 @@ class GeminiClient(LLMClient):
                     ]
                 }
             ]
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
-        data = await self._post_json(
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models"
+            f"/{self.model}:generateContent?key={self.api_key}"
+        )
+        data = await self._http_post(
             url,
             headers={"Content-Type": "application/json"},
             payload=payload,
         )
+
         candidate = (data.get("candidates") or [{}])[0]
         content_parts = (candidate.get("content") or {}).get("parts", [])
         text_parts = [part.get("text") for part in content_parts if "text" in part]
         content = "".join(part for part in text_parts if part)
+
         tool_calls = []
         for part in content_parts:
             if "functionCall" in part:
@@ -61,6 +78,27 @@ class GeminiClient(LLMClient):
                     )
                 )
         return LLMResponse(content=content, tool_calls=tool_calls)
+
+    # ------------------------------------------------------------------
+    # Gemini embeds retry delay in the JSON error body
+    # ------------------------------------------------------------------
+
+    def _retry_delay_from_body(
+        self,
+        body: Dict[str, Any],
+        attempt: int,
+        base: float,
+    ) -> float:
+        """Gemini error bodies may contain retryDelay e.g. '30s'."""
+        try:
+            details = body.get("error", {}).get("details", [])
+            for detail in details:
+                raw = detail.get("retryDelay", "")
+                if raw:
+                    return min(float(raw.rstrip("s")), _MAX_DELAY)
+        except Exception:
+            pass
+        return super()._retry_delay_from_body(body, attempt, base)
 
 
 def _sanitize_message(message: Dict[str, Any]) -> Dict[str, Any]:
