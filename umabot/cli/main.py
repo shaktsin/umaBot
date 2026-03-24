@@ -127,6 +127,25 @@ def main() -> None:
     tasks_cancel_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
     tasks_cancel_parser.add_argument("id", type=int)
 
+    # Google Workspace integration
+    google_parser = subparsers.add_parser("google", help="Manage Google Workspace integration (Gmail, Calendar, Tasks)")
+    google_parser.add_argument("--config", dest="config", default=None)
+    google_subparsers = google_parser.add_subparsers(dest="google_command")
+
+    g_setup = google_subparsers.add_parser("setup", help="Import credentials from client_secret.json or prompt")
+    g_setup.add_argument("--config", dest="config", default=None)
+    g_setup.add_argument("--credentials", metavar="FILE", default=None,
+                         help="Path to downloaded client_secret.json")
+
+    g_login = google_subparsers.add_parser("login", help="Authorise via browser (opens OAuth flow)")
+    g_login.add_argument("--config", dest="config", default=None)
+
+    g_status = google_subparsers.add_parser("status", help="Show current auth state")
+    g_status.add_argument("--config", dest="config", default=None)
+
+    g_logout = google_subparsers.add_parser("logout", help="Revoke and delete stored token")
+    g_logout.add_argument("--config", dest="config", default=None)
+
     # Web control panel
     panel_parser = subparsers.add_parser("panel", help="Start local web control panel (http://127.0.0.1:8080)")
     panel_parser.add_argument("--config", dest="config", default=None, help="Path to config file")
@@ -230,6 +249,20 @@ def main() -> None:
             no_open=args.no_open,
             log_level=args.log_level,
         )
+
+    elif args.command == "google":
+        from umabot.cli.google import cmd_setup, cmd_login, cmd_status, cmd_logout
+        subcmd = getattr(args, "google_command", None) or "status"
+        if subcmd == "setup":
+            cmd_setup(args)
+        elif subcmd == "login":
+            cmd_login(args)
+        elif subcmd == "status":
+            cmd_status(args)
+        elif subcmd == "logout":
+            cmd_logout(args)
+        else:
+            google_parser.print_help()
 
     elif args.command == "control-panel":
         from umabot.cli.control_panel_setup import run_setup

@@ -81,11 +81,67 @@ def create_app(
     app.include_router(logs.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
 
+    # Google OAuth callback
+    _add_oauth_routes(app)
+
     # Serve built frontend SPA (if it exists)
     if STATIC_DIR.exists():
         app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
     return app
+
+
+def _add_oauth_routes(app: FastAPI) -> None:
+    """Add Google OAuth2 callback endpoint."""
+    from fastapi import Request
+    from fastapi.responses import HTMLResponse
+
+    @app.get("/oauth/google/callback", response_class=HTMLResponse, include_in_schema=False)
+    async def google_oauth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+        if error:
+            return HTMLResponse(
+                f"<h2>❌ Google authorisation failed</h2><p>{error}</p>",
+                status_code=400,
+            )
+        if not code or not state:
+            return HTMLResponse("<h2>❌ Missing code or state</h2>", status_code=400)
+
+        config = request.app.state.config
+        db = request.app.state.db
+
+        google_cfg = getattr(config, "google", None)
+        if not google_cfg:
+            return HTMLResponse("<h2>❌ Google not configured</h2>", status_code=400)
+
+        client_id = getattr(google_cfg, "client_id", "") or ""
+        client_secret = getattr(google_cfg, "client_secret", "") or ""
+        if not client_id or not client_secret:
+            return HTMLResponse("<h2>❌ Google client credentials not set</h2>", status_code=400)
+
+        control = config.control_panel
+        redirect_uri = f"http://{control.web_host}:{control.web_port}/oauth/google/callback"
+
+        try:
+            from umabot.tools.google.auth import exchange_code
+            exchange_code(
+                client_id=client_id,
+                client_secret=client_secret,
+                redirect_uri=redirect_uri,
+                code=code,
+                state=state,
+                db=db,
+            )
+        except Exception as exc:
+            logger.error("Google OAuth exchange failed: %s", exc)
+            return HTMLResponse(
+                f"<h2>❌ Token exchange failed</h2><p>{exc}</p>",
+                status_code=400,
+            )
+
+        return HTMLResponse(
+            "<h2>✅ Google authorised successfully!</h2>"
+            "<p>You can close this window and retry your request in the bot.</p>"
+        )
 
 
 def run_panel(

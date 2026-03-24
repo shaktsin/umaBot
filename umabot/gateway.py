@@ -16,7 +16,7 @@ from umabot.router import ControlConfig, MessageRouter
 from umabot.scheduler import TaskScheduler
 from umabot.skills import SkillRegistry, SkillRuntimeProvisioner
 from umabot.storage import Database, Queue
-from umabot.tools import ToolRegistry, UnifiedToolRegistry, register_builtin_tools
+from umabot.tools import ToolRegistry, UnifiedToolRegistry, register_builtin_tools, register_google_tools
 from umabot.worker import Worker
 from umabot.ws import ChannelHub, WebsocketGateway
 
@@ -95,7 +95,7 @@ class Gateway:
     async def reload(self) -> None:
         logger.info("Reloading configuration")
         config, config_path, tool_registry, policy, skill_registry, unified_registry = _reload_runtime(
-            self.config_path, overrides=self.overrides
+            self.config_path, overrides=self.overrides, db=self.db
         )
         self.config = config
         self.config_path = config_path
@@ -172,13 +172,8 @@ class Gateway:
             )
 
     async def send_control_message(self, fallback_channel: str, fallback_chat_id: str, text: str) -> None:
-        """Send message to control panel, with fallback to original channel."""
-        # Try new control panel first
-        if self._control_panel.config.enabled:
-            # Web panel: route directly through the hub to the web-panel connector
-            if self._control_panel.config.ui_type == "web":
-                await self.send_message("web", "admin", text, connector="web-panel")
-                return
+        """Send message to all enabled control panels simultaneously."""
+        if self._control_panel.panels:
             await self._control_panel.send_notification(text)
             return
 
@@ -351,6 +346,7 @@ def build_runtime(config_path: Optional[str] = None, overrides: Optional[Dict[st
         enable_shell=config.tools.shell_enabled,
         skill_registry=skill_registry,
     )
+    _register_google(tool_registry, config, db)
 
     unified_registry = UnifiedToolRegistry()
     for tool in tool_registry.list().values():
@@ -360,7 +356,7 @@ def build_runtime(config_path: Optional[str] = None, overrides: Optional[Dict[st
     return config, resolved_path, db, queue, tool_registry, policy, skill_registry, unified_registry
 
 
-def _reload_runtime(config_path: str, overrides: Optional[Dict[str, str]] = None):
+def _reload_runtime(config_path: str, overrides: Optional[Dict[str, str]] = None, db=None):
     config, resolved_path = load_config(config_path=config_path, overrides=overrides)
     _apply_worker_path(config)
     provisioner = SkillRuntimeProvisioner(config.skills)
@@ -373,6 +369,8 @@ def _reload_runtime(config_path: str, overrides: Optional[Dict[str, str]] = None
         enable_shell=config.tools.shell_enabled,
         skill_registry=skill_registry,
     )
+    if db is not None:
+        _register_google(tool_registry, config, db)
 
     unified_registry = UnifiedToolRegistry()
     for tool in tool_registry.list().values():
@@ -380,6 +378,28 @@ def _reload_runtime(config_path: str, overrides: Optional[Dict[str, str]] = None
 
     policy = PolicyEngine(tool_registry, strictness=config.policy.confirmation_strictness)
     return config, resolved_path, tool_registry, policy, skill_registry, unified_registry
+
+
+def _register_google(tool_registry: ToolRegistry, config, db) -> None:
+    """Register Google Workspace tools if credentials are configured."""
+    # Prefer integrations.google; fall back to deprecated flat google: block
+    google_cfg = getattr(getattr(config, "integrations", None), "google", None) \
+                 or getattr(config, "google", None)
+    if not google_cfg:
+        return
+    client_id = getattr(google_cfg, "client_id", "") or ""
+    client_secret = getattr(google_cfg, "client_secret", "") or ""
+    if client_id and client_secret:
+        # Attach redirect_uri hint so google.authorize can build the URL
+        control = config.control_panel
+        base = f"http://{control.web_host}:{control.web_port}"
+        db._google_redirect_uri = f"{base}/oauth/google/callback"
+        register_google_tools(
+            tool_registry,
+            client_id=client_id,
+            client_secret=client_secret,
+            db=db,
+        )
 
 
 def _apply_worker_path(config) -> None:

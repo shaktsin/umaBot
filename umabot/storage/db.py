@@ -107,9 +107,16 @@ class Database:
                     error TEXT,
                     FOREIGN KEY(task_id) REFERENCES tasks(id)
                 );
+                CREATE TABLE IF NOT EXISTS oauth_tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL UNIQUE,
+                    token_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
         self._ensure_session_connector()
+        self._ensure_audit_columns()
 
     def close(self) -> None:
         self._conn.close()
@@ -153,11 +160,29 @@ class Database:
                 (message_id, tool_name, json.dumps(args), json.dumps(result), _now()),
             )
 
-    def add_audit(self, event_type: str, details: Dict[str, Any]) -> None:
+    def add_audit(
+        self,
+        event_type: str,
+        details: Dict[str, Any],
+        *,
+        user_id: str = "",
+        connector: str = "",
+        chat_id: str = "",
+        decision: str = "",
+    ) -> None:
+        payload = dict(details)
+        if user_id:
+            payload["user_id"] = user_id
+        if connector:
+            payload["connector"] = connector
+        if chat_id:
+            payload["chat_id"] = chat_id
+        if decision:
+            payload["decision"] = decision
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO audit_log (event_type, details_json, created_at) VALUES (?, ?, ?)",
-                (event_type, json.dumps(details), _now()),
+                (event_type, json.dumps(payload), _now()),
             )
 
     def update_connector_status(self, connector: str, channel: str, mode: str, status: str) -> None:
@@ -188,12 +213,53 @@ class Database:
             return None
         return row["session_data"]
 
+    # ------------------------------------------------------------------
+    # OAuth token storage
+    # ------------------------------------------------------------------
+
+    def store_oauth_token(self, provider: str, token_json: str) -> None:
+        """Upsert an OAuth token JSON blob for the given provider."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO oauth_tokens (provider, token_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(provider) DO UPDATE
+                    SET token_json = excluded.token_json,
+                        updated_at = excluded.updated_at
+                """,
+                (provider, token_json, _now()),
+            )
+
+    def get_oauth_token(self, provider: str) -> Optional[str]:
+        """Return the raw token JSON for provider, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT token_json FROM oauth_tokens WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+        return row["token_json"] if row else None
+
+    def delete_oauth_token(self, provider: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM oauth_tokens WHERE provider = ?", (provider,)
+            )
+
+    # ------------------------------------------------------------------
+    # Schema migrations
+    # ------------------------------------------------------------------
+
     def _ensure_session_connector(self) -> None:
         with self._lock, self._conn:
             cols = self._conn.execute("PRAGMA table_info(sessions)").fetchall()
             names = {row[1] for row in cols}
             if "connector" not in names:
                 self._conn.execute("ALTER TABLE sessions ADD COLUMN connector TEXT NOT NULL DEFAULT ''")
+
+    def _ensure_audit_columns(self) -> None:
+        """No-op: audit_log uses a flexible JSON details column; no migration needed."""
+        pass
 
     def enqueue_job(self, chat_id: str, channel: str, payload: Dict[str, Any]) -> int:
         with self._lock, self._conn:

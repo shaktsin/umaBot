@@ -5,6 +5,7 @@ import logging
 import os
 import platform
 import subprocess
+import typing
 from dataclasses import is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -50,6 +51,12 @@ ENV_MAP = {
     "UMABOT_WS_HOST": ("runtime", "ws_host"),
     "UMABOT_WS_PORT": ("runtime", "ws_port"),
     "UMABOT_WS_TOKEN": ("runtime", "ws_token"),
+    # Google Workspace integration (nested under integrations.google)
+    # Flat google.* env vars handled separately in _apply_env_map via integrations block
+    "GOOGLE_CLIENT_ID": ("google", "client_id"),          # deprecated flat field
+    "GOOGLE_CLIENT_SECRET": ("google", "client_secret"),  # deprecated flat field
+    "UMABOT_GOOGLE_CLIENT_ID": ("google", "client_id"),
+    "UMABOT_GOOGLE_CLIENT_SECRET": ("google", "client_secret"),
 }
 
 
@@ -258,6 +265,16 @@ def _apply_env_map(cfg: Config, env: Dict[str, Any]) -> None:
             value = str(value)
         setattr(target, field, value)
 
+    # Also apply Google env vars to the canonical integrations.google block
+    for env_key, attr in (
+        ("GOOGLE_CLIENT_ID", "client_id"),
+        ("UMABOT_GOOGLE_CLIENT_ID", "client_id"),
+        ("GOOGLE_CLIENT_SECRET", "client_secret"),
+        ("UMABOT_GOOGLE_CLIENT_SECRET", "client_secret"),
+    ):
+        if env_key in env and env[env_key]:
+            setattr(cfg.integrations.google, attr, env[env_key])
+
 
 def _apply_overrides(cfg: Config, overrides: Dict[str, Any]) -> None:
     for key, value in overrides.items():
@@ -292,14 +309,54 @@ def _update_dataclass(dc: Any, data: Dict[str, Any]) -> None:
         _update_skills_config(dc, data)
         return
 
+    hints = typing.get_type_hints(type(dc)) if is_dataclass(dc) else {}
+
     for key, value in data.items():
         if not hasattr(dc, key):
             continue
         current = getattr(dc, key)
         if is_dataclass(current) and isinstance(value, dict):
             _update_dataclass(current, value)
+        elif isinstance(current, list) and isinstance(value, list):
+            elem_type = _list_element_type(hints.get(key))
+            if elem_type and is_dataclass(elem_type):
+                converted = []
+                for item in value:
+                    if isinstance(item, dict):
+                        obj = _dataclass_from_dict(elem_type, item)
+                        converted.append(obj)
+                    else:
+                        converted.append(item)
+                setattr(dc, key, converted)
+            else:
+                setattr(dc, key, value)
         else:
             setattr(dc, key, value)
+
+
+def _list_element_type(hint: Any) -> Any:
+    """Extract T from List[T], or None if not a generic list hint."""
+    if hint is None:
+        return None
+    origin = getattr(hint, "__origin__", None)
+    if origin is list:
+        args = getattr(hint, "__args__", ())
+        if args:
+            return args[0]
+    return None
+
+
+def _dataclass_from_dict(cls: Any, data: Dict[str, Any]) -> Any:
+    """Instantiate a dataclass from a dict, using field defaults for missing keys."""
+    import dataclasses
+    field_defaults: Dict[str, Any] = {}
+    for f in dataclasses.fields(cls):
+        if f.default is not dataclasses.MISSING:
+            field_defaults[f.name] = f.default
+        elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+            field_defaults[f.name] = f.default_factory()
+    kwargs = {**field_defaults, **{k: v for k, v in data.items() if k in field_defaults or any(f.name == k for f in dataclasses.fields(cls))}}
+    return cls(**kwargs)
 
 
 def _update_skills_config(cfg: SkillsConfig, data: Dict[str, Any]) -> None:

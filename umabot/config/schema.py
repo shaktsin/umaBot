@@ -60,6 +60,92 @@ class ChannelConfig:
 
 
 @dataclass
+class GoogleConfig:
+    """Google Workspace integration (Gmail, Calendar, Tasks).
+
+    Create a GCP OAuth 2.0 'Web application' credential and paste the values here
+    or set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET environment variables.
+    """
+
+    client_id: str = ""
+    client_secret: str = ""
+
+
+@dataclass
+class IntegrationsConfig:
+    """Third-party service integrations the bot can act on.
+
+    Distinct from *connectors* (messaging channels the bot listens on) and
+    *skills* (domain knowledge). Integrations are external services the LLM
+    calls via built-in tools (gmail.*, gcal.*, gtasks.*, github.*, …).
+
+    Example config.yaml::
+
+        integrations:
+          google:
+            client_id: "123456789.apps.googleusercontent.com"
+            client_secret: "GOCSPX-..."
+    """
+
+    google: GoogleConfig = field(default_factory=GoogleConfig)
+
+
+@dataclass
+class SecurityRoleConfig:
+    """Per-role tool permissions."""
+
+    # Tool name patterns allowed for this role (supports fnmatch globs, e.g. 'gmail.*')
+    allow: List[str] = field(default_factory=lambda: ["*"])
+    # Tool name patterns always denied for this role (takes precedence over allow)
+    deny: List[str] = field(default_factory=list)
+    # Whether RISK_RED tools require explicit approval for this role
+    require_approval_for_red: bool = True
+    # Whether RISK_YELLOW tools require explicit approval for this role
+    require_approval_for_yellow: bool = False
+
+
+@dataclass
+class SecurityConfig:
+    """Security policy layer.
+
+    Controls tool access per connector, per user, and enables SSRF protection
+    and credential masking in tool output.
+
+    Example config.yaml::
+
+        security:
+          ssrf_protection: true
+          mask_secrets_in_output: true
+          roles:
+            admin:
+              allow: ["*"]
+              require_approval_for_red: false
+            user:
+              deny: ["shell.*"]
+              require_approval_for_red: true
+          users:
+            "123456789":   # Telegram user_id → role name
+              role: admin
+          connectors:
+            internal-bot:
+              default_role: admin
+    """
+
+    enabled: bool = True
+    ssrf_protection: bool = True
+    mask_secrets_in_output: bool = True
+
+    # Named role definitions
+    roles: Dict[str, Any] = field(default_factory=dict)
+
+    # user_id → {"role": "admin"} mapping
+    users: Dict[str, Any] = field(default_factory=dict)
+
+    # connector_name → {"default_role": "user"} overrides
+    connectors: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ToolsConfig:
     shell_enabled: bool = False
 
@@ -199,6 +285,7 @@ class AgentsConfig:
 
         agents:
           enabled: true
+          context_file: ~/.umabot/AGENT.md   # optional — user-defined agent context
           orchestrator:
             provider: openai
             model: o3
@@ -209,6 +296,10 @@ class AgentsConfig:
     """
 
     enabled: bool = False
+    # Path to a Markdown file whose content is injected into every agent's
+    # system prompt.  Edit this file to give the bot a persona, standing
+    # instructions, personal facts, or domain context.
+    context_file: str = "~/.umabot/AGENT.md"
     orchestrator: AgentModelConfig = field(default_factory=AgentModelConfig)
     worker: AgentModelConfig = field(default_factory=AgentModelConfig)
     # Maximum tool-call iterations per spawned agent
@@ -223,7 +314,13 @@ class AgentsConfig:
 @dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
+    # Single primary control panel (kept for backward compat with existing configs).
+    # When multiple panels are needed (e.g. web + telegram) populate control_panels
+    # list instead — or use both: primary + extras.
     control_panel: ControlPanelConfig = field(default_factory=ControlPanelConfig)
+    # Additional control panels that run alongside the primary one.
+    # Every enabled panel receives all notifications simultaneously.
+    control_panels: List[ControlPanelConfig] = field(default_factory=list)
     connectors: List[ConnectorConfig] = field(default_factory=list)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
@@ -234,6 +331,11 @@ class Config:
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     skill_configs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     skill_dirs: List[str] = field(default_factory=list)  # Additional skill directories
+    integrations: IntegrationsConfig = field(default_factory=IntegrationsConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
+
+    # Deprecated flat field — kept so existing configs with `google:` still load
+    google: GoogleConfig = field(default_factory=GoogleConfig)
     # DEPRECATED: telegram/discord/whatsapp fields - use connectors list instead
     # Kept for backward compatibility
     telegram: ChannelConfig = field(default_factory=ChannelConfig)
@@ -248,6 +350,8 @@ class Config:
         self.storage.vault_dir = _expand_path(self.storage.vault_dir)
         self.runtime.pid_file = _expand_path(self.runtime.pid_file)
         self.runtime.log_dir = _expand_path(self.runtime.log_dir)
+        if self.agents.context_file:
+            self.agents.context_file = _expand_path(self.agents.context_file)
         _resolve_skill_runtime_override(self.skills.defaults)
         if not self.skills.defaults.python_bin:
             self.skills.defaults.python_bin = sys.executable

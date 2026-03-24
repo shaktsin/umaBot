@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from umabot.llm.base import LLMClient, LLMResponse, ToolCall
@@ -26,6 +27,15 @@ logger = logging.getLogger("umabot.agents.orchestrator")
 # ---------------------------------------------------------------------------
 _ORCHESTRATOR_SYSTEM = """\
 You are a dynamic task orchestrator for a personal AI assistant.
+
+Current date/time: {current_datetime} (UTC)
+Current local date: {current_date}
+Day of week: {day_of_week}
+Start of this week (Monday): {week_start}
+End of this week (Sunday): {week_end}
+
+When the user refers to relative dates ("today", "this week", "tomorrow", "next Monday", etc.)
+compute them from the current date above and pass concrete ISO 8601 timestamps to tools.
 
 Your responsibilities:
 1. Analyse the user's request and decide what specialist agents are needed.
@@ -54,7 +64,7 @@ Available tools for you to call:
 
 Available tools you can grant to agents (tool_names list):
 {tool_catalog}
-{skill_section}"""
+{skill_section}{agent_context_section}"""
 
 
 class DynamicOrchestrator:
@@ -86,6 +96,7 @@ class DynamicOrchestrator:
         max_agent_iterations: int = 15,
         skill_context: str = "",
         skill_context_full: str = "",
+        agent_context: str = "",
     ) -> None:
         self.orchestrator_llm = orchestrator_llm
         self.agent_llm = agent_llm
@@ -98,6 +109,8 @@ class DynamicOrchestrator:
         self.skill_context = skill_context
         # Full skill body injected into spawned agents' context (not into orchestrator prompt)
         self.skill_context_full = skill_context_full
+        # User-defined standing context from AGENT.md
+        self.agent_context = agent_context
 
     async def run(self, task: str, history: Optional[List[Dict[str, Any]]] = None) -> str:
         """Run the full orchestration for ``task`` and return the final reply.
@@ -112,9 +125,26 @@ class DynamicOrchestrator:
             "\n(Full skill instructions will be injected into each spawned agent automatically.)"
             if self.skill_context else ""
         )
+
+        now_utc = datetime.now(timezone.utc)
+        # Monday=0 … Sunday=6; back-calculate to Monday
+        week_start = now_utc.date() - timedelta(days=now_utc.weekday())
+        week_end = week_start + timedelta(days=6)
+
+        agent_context_section = (
+            f"\n\n--- User-defined agent context (from AGENT.md) ---\n{self.agent_context}\n---"
+            if self.agent_context.strip() else ""
+        )
+
         system_prompt = _ORCHESTRATOR_SYSTEM.format(
+            current_datetime=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            current_date=now_utc.strftime("%Y-%m-%d"),
+            day_of_week=now_utc.strftime("%A"),
+            week_start=week_start.isoformat(),
+            week_end=week_end.isoformat(),
             tool_catalog=tool_catalog,
             skill_section=skill_note,
+            agent_context_section=agent_context_section,
         )
 
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]

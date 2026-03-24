@@ -23,7 +23,7 @@ from umabot.config.schema import (
     default_config,
 )
 from umabot.llm.openai_client import _is_reasoning_model
-from umabot.config.loader import save_config as save_cfg, store_secrets
+from umabot.config.loader import load_config, save_config as save_cfg, store_secrets
 from umabot.storage import Database
 
 console = Console()
@@ -34,225 +34,159 @@ def run_wizard(
     install_daemon: bool = False,
     reset: bool = False,
 ) -> str:
-    """
-    Run interactive onboarding wizard with beautiful prompts.
+    """Run interactive onboarding wizard — additive on re-runs.
 
-    Args:
-        config_path: Path to config file (default: ~/.umabot/config.yaml)
-        install_daemon: Install system daemon (systemd/launchd)
-        reset: Reset existing configuration
-
-    Returns:
-        Path to created config file
+    Fresh install: walks every step in order.
+    Existing config: shows current state and lets the user pick which
+    steps to run; unselected steps are left exactly as-is.
     """
-    console.print(
-        Panel.fit(
-            "[bold cyan]UMA BOT Onboarding Wizard[/bold cyan]\n"
-            "Let's set up your personal AI assistant",
-            border_style="cyan",
+    config_file = Path(config_path).expanduser() if config_path else Path.home() / ".umabot" / "config.yaml"
+    is_update = config_file.exists() and not reset
+
+    if is_update:
+        console.print(
+            Panel.fit(
+                "[bold cyan]UMA BOT Setup[/bold cyan]\n"
+                f"Updating existing configuration at [dim]{config_file}[/dim]",
+                border_style="cyan",
+            )
         )
-    )
-
-    # Determine config file path
-    if config_path:
-        config_file = Path(config_path).expanduser()
-    else:
-        config_file = Path.home() / ".umabot" / "config.yaml"
-
-    # Check if config exists
-    if config_file.exists() and not reset:
-        overwrite = questionary.confirm(
-            f"Configuration already exists at {config_file}. Overwrite?",
-            default=False,
-        ).ask()
-        if not overwrite:
-            console.print("[yellow]Setup cancelled.[/yellow]")
+        cfg, _ = load_config(config_path=str(config_file))
+        _print_current_status(cfg)
+        selected = _pick_steps(cfg)
+        if not selected:
+            console.print("[yellow]Nothing selected — no changes made.[/yellow]")
             return str(config_file)
-
-    # Setup mode
-    setup_mode = questionary.select(
-        "Choose setup mode:",
-        choices=[
-            Choice("QuickStart (recommended defaults)", value="quickstart"),
-            Choice("Advanced (full configuration)", value="advanced"),
-        ],
-    ).ask()
-
-    cfg = default_config()
-
-    # Step 1: AI Provider
-    console.print("\n[bold]Step 1: AI Provider[/bold]")
-    provider = questionary.select(
-        "Select your AI provider:",
-        choices=[
-            Choice("OpenAI (GPT-4, GPT-4o)", value="openai"),
-            Choice("Anthropic Claude", value="claude"),
-            Choice("Google Gemini", value="gemini"),
-        ],
-        default="openai",
-    ).ask()
-
-    cfg.llm.provider = provider
-
-    # Provider-specific model selection
-    models = _get_models_for_provider(provider)
-    model = questionary.select(f"Select {provider} model:", choices=models).ask()
-    cfg.llm.model = model
-
-    # Reasoning effort for OpenAI o-series models
-    if provider == "openai" and _is_reasoning_model(model):
-        effort = questionary.select(
-            "Reasoning effort (higher = smarter but slower and more expensive):",
+        setup_mode = "quickstart"
+    else:
+        console.print(
+            Panel.fit(
+                "[bold cyan]UMA BOT Onboarding Wizard[/bold cyan]\n"
+                "Let's set up your personal AI assistant",
+                border_style="cyan",
+            )
+        )
+        cfg = default_config()
+        selected = {"llm", "control_panel", "connectors", "integrations", "tools"}
+        setup_mode = questionary.select(
+            "Choose setup mode:",
             choices=[
-                Choice("High — best quality, follows complex instructions carefully", value="high"),
-                Choice("Medium — balanced speed and quality (recommended)", value="medium"),
-                Choice("Low — fastest, cheapest, good for simple tasks", value="low"),
+                Choice("QuickStart (recommended defaults)", value="quickstart"),
+                Choice("Advanced (full configuration)", value="advanced"),
             ],
-            default="medium",
-        ).ask()
-        cfg.llm.reasoning_effort = effort
-        console.print(f"[green]✓ Reasoning effort set to: {effort}[/green]")
+        ).ask() or "quickstart"
 
-    api_key = _prompt_required_secret(f"Enter {provider} API key:")
-    cfg.llm.api_key = api_key
+    # Tokens to (re-)store in keychain/env — only populated when the user
+    # explicitly enters a new value for that secret.
+    new_api_key = ""
+    new_telegram_token = ""
+    new_discord_token = ""
 
-    # Step 2: Control Panel Setup
-    console.print("\n[bold]Step 2: Control Panel[/bold]")
-    console.print(
-        "The control panel is YOUR private interface for confirmations and management.\n"
-        "This is separate from message connectors (which handle external messages)."
-    )
-
-    telegram_token = ""
-    discord_token = ""
-
-    setup_control = questionary.confirm("Set up control panel now?", default=True).ask()
-
-    if setup_control:
-        ui_type = questionary.select(
-            "Choose control panel UI type:",
+    # ── Step 1: AI Provider ───────────────────────────────────────────────
+    if "llm" in selected:
+        console.print("\n[bold]Step 1: AI Provider[/bold]")
+        provider = questionary.select(
+            "Select your AI provider:",
             choices=[
-                Choice("Web UI (local browser) — recommended", value="web"),
-                Choice("Telegram Bot (remote messaging)", value="telegram"),
-                Choice("Discord Bot (remote messaging)", value="discord"),
-                Choice("CLI Chat (local terminal) [Coming Soon]", value="cli"),
-                Choice("Skip for now", value="none"),
+                Choice("OpenAI (GPT-4, GPT-4o)", value="openai"),
+                Choice("Anthropic Claude", value="claude"),
+                Choice("Google Gemini", value="gemini"),
             ],
+            default=cfg.llm.provider or "openai",
         ).ask()
+        cfg.llm.provider = provider
 
-        if ui_type == "telegram":
-            console.print("\n[cyan]━━━ Telegram Control Panel Setup ━━━[/cyan]\n")
-            console.print(
-                "We'll automatically discover your chat ID by having you send a message to your bot.\n"
-            )
+        models = _get_models_for_provider(provider)
+        model = questionary.select(
+            f"Select {provider} model:",
+            choices=models,
+        ).ask()
+        cfg.llm.model = model
 
-            # Use automatic setup from control_panel_setup
-            from umabot.cli.control_panel_setup import _get_bot_token_and_discover_chat_id
-
-            result = asyncio.run(_get_bot_token_and_discover_chat_id())
-
-            if result:
-                telegram_token, chat_id, bot_username = result
-
-                cfg.control_panel.enabled = True
-                cfg.control_panel.ui_type = "telegram"
-                cfg.control_panel.connector = "control_panel_bot"
-                cfg.control_panel.chat_id = chat_id
-
-                # Add control panel connector
-                cfg.connectors.append(
-                    ConnectorConfig(
-                        name="control_panel_bot",
-                        type="telegram_bot",
-                        token=telegram_token
-                    )
-                )
-                console.print(f"[green]✓ Control panel configured via Telegram (@{bot_username})[/green]")
-            else:
-                console.print("[yellow]Control panel setup skipped[/yellow]")
-
-        elif ui_type == "discord":
-            discord_token = _prompt_required_secret(
-                "Enter Discord bot token for control panel:"
-            )
-
-            chat_id = questionary.text("Enter your Discord channel ID:").ask()
-
-            cfg.control_panel.enabled = True
-            cfg.control_panel.ui_type = "discord"
-            cfg.control_panel.connector = "control_panel_bot"
-            cfg.control_panel.chat_id = chat_id
-
-            cfg.connectors.append(
-                ConnectorConfig(
-                    name="control_panel_bot",
-                    type="discord",
-                    token=discord_token
-                )
-            )
-            console.print("[green]✓ Control panel configured via Discord[/green]")
-
-        elif ui_type == "web":
-            console.print("\n[cyan]━━━ Web Control Panel Setup ━━━[/cyan]\n")
-            port_str = questionary.text(
-                "Port for the web panel (default: 8080):",
-                default="8080",
+        if provider == "openai" and _is_reasoning_model(model):
+            effort = questionary.select(
+                "Reasoning effort:",
+                choices=[
+                    Choice("High — best quality", value="high"),
+                    Choice("Medium — balanced (recommended)", value="medium"),
+                    Choice("Low — fastest / cheapest", value="low"),
+                ],
+                default=cfg.llm.reasoning_effort or "medium",
             ).ask()
-            try:
-                port = int(port_str or "8080")
-            except ValueError:
-                port = 8080
+            cfg.llm.reasoning_effort = effort
 
-            cfg.control_panel.enabled = True
-            cfg.control_panel.ui_type = "web"
-            cfg.control_panel.web_host = "127.0.0.1"
-            cfg.control_panel.web_port = port
-            console.print(
-                f"[green]✓ Web control panel configured at http://127.0.0.1:{port}[/green]\n"
-                f"  [dim]Starts automatically with [bold]umabot start[/bold][/dim]"
-            )
+        key_hint = " [dim](press Enter to keep existing)[/dim]" if is_update else ""
+        raw = questionary.password(f"Enter {provider} API key:{key_hint}").ask() or ""
+        if raw.strip():
+            new_api_key = raw.strip()
+            cfg.llm.api_key = new_api_key
+        elif is_update:
+            console.print("[dim]  → API key unchanged.[/dim]")
 
-        elif ui_type == "cli":
-            console.print("[yellow]CLI control panel coming in a future release.[/yellow]")
-            cfg.control_panel.enabled = False
+    # ── Step 2: Control Panel ────────────────────────────────────────────
+    if "control_panel" in selected:
+        console.print("\n[bold]Step 2: Control Panel[/bold]")
+        console.print(
+            "[dim]Your private interface for confirmations and management.\n"
+            "You can run multiple control panels (e.g. web + Telegram) simultaneously.[/dim]\n"
+        )
+        new_tokens: dict = {}
+        _step_control_panel(cfg, is_update, new_tokens)
+        new_telegram_token = new_tokens.get("telegram", "")
+        new_discord_token = new_tokens.get("discord", "")
 
-    # Step 3: Message Connectors
-    console.print("\n[bold]Step 3: Message Connectors[/bold]")
-    console.print("Message connectors receive messages from various platforms.")
-
-    add_connectors = questionary.confirm("Add message connectors?", default=True).ask()
-
-    if add_connectors:
+    # ── Step 3: Message Connectors ───────────────────────────────────────
+    if "connectors" in selected:
+        console.print("\n[bold]Step 3: Message Connectors[/bold]")
+        if cfg.connectors:
+            names = ", ".join(c.name for c in cfg.connectors)
+            console.print(f"[dim]Currently configured: {names}[/dim]")
+        console.print("[dim]Add more connectors below — existing ones are kept.[/dim]")
         _setup_connectors_interactive(cfg)
 
-    # Step 4: Tools
-    console.print("\n[bold]Step 4: Tools[/bold]")
+    # ── Step 4: Integrations ─────────────────────────────────────────────
+    if "integrations" in selected:
+        console.print("\n[bold]Step 4: Integrations[/bold]")
+        console.print(
+            "[dim]Third-party services the bot acts on (not messaging channels).[/dim]\n"
+        )
+        _setup_integrations_interactive(cfg)
 
-    cfg.tools.shell_enabled = questionary.confirm(
-        "Enable shell command tool? (requires careful security)", default=False
-    ).ask()
-
-    # Step 5: Security (if advanced mode)
-    if setup_mode == "advanced":
-        strictness = questionary.select(
-            "Confirmation strictness:",
-            choices=[
-                Choice("Normal (confirm RED tier only)", value="normal"),
-                Choice("Strict (confirm all tools)", value="strict"),
-            ],
-            default="normal",
+    # ── Step 5: Tools & Security ─────────────────────────────────────────
+    if "tools" in selected:
+        console.print("\n[bold]Step 5: Tools[/bold]")
+        current = "[green]enabled[/green]" if cfg.tools.shell_enabled else "[dim]disabled[/dim]"
+        cfg.tools.shell_enabled = questionary.confirm(
+            f"Enable shell command tool? (currently {current})",
+            default=cfg.tools.shell_enabled,
         ).ask()
-        cfg.policy.confirmation_strictness = strictness
 
-    # Step 6: Generate WebSocket token
-    cfg.runtime.ws_token = secrets.token_urlsafe(32)
+        if setup_mode == "advanced":
+            strictness = questionary.select(
+                "Confirmation strictness:",
+                choices=[
+                    Choice("Normal (confirm RED tier only)", value="normal"),
+                    Choice("Strict (confirm all tools)", value="strict"),
+                ],
+                default=cfg.policy.confirmation_strictness or "normal",
+            ).ask()
+            cfg.policy.confirmation_strictness = strictness
 
-    # Create config directory if needed
+    # ── Persist ──────────────────────────────────────────────────────────
+    # Generate ws_token only if one doesn't already exist
+    if not cfg.runtime.ws_token:
+        cfg.runtime.ws_token = secrets.token_urlsafe(32)
+
     config_file.parent.mkdir(parents=True, exist_ok=True)
-
-    # Save configuration
+    _ensure_agent_context_file(config_file.parent)
     save_cfg(cfg, str(config_file))
-    store_secrets(api_key=api_key, telegram_token=telegram_token, discord_token=discord_token)
+
+    # Only store secrets the user explicitly provided in this run
+    store_secrets(
+        api_key=new_api_key,
+        telegram_token=new_telegram_token,
+        discord_token=new_discord_token,
+    )
 
     panel_hint = ""
     if cfg.control_panel.enabled and cfg.control_panel.ui_type == "web":
@@ -261,6 +195,7 @@ def run_wizard(
             " (starts with daemon)"
         )
 
+    agent_md_path = config_file.parent / "AGENT.md"
     console.print(
         Panel.fit(
             f"[bold green]✓ Configuration saved to {config_file}[/bold green]\n\n"
@@ -268,16 +203,357 @@ def run_wizard(
             "  • Run [cyan]umabot doctor[/cyan] to verify setup\n"
             "  • Run [cyan]umabot start[/cyan] to start daemon"
             f"{panel_hint}\n"
+            f"  • Edit [cyan]{agent_md_path}[/cyan] to give the bot context about you\n"
             "  • Run [cyan]umabot connections[/cyan] to check status",
             border_style="green",
         )
     )
 
-    # Optional daemon installation
     if install_daemon:
         _install_system_daemon(config_file)
 
     return str(config_file)
+
+
+# ---------------------------------------------------------------------------
+# Wizard helpers
+# ---------------------------------------------------------------------------
+
+def _all_active_panels(cfg: Config) -> list:
+    """Return deduplicated list of all enabled control panels across both config fields."""
+    seen: set = set()
+    panels = []
+    for p in list(cfg.control_panels) + ([cfg.control_panel] if cfg.control_panel.enabled else []):
+        key = (p.ui_type, p.chat_id or "", p.connector or "")
+        if key not in seen:
+            seen.add(key)
+            panels.append(p)
+    return panels
+
+
+def _panel_label(p) -> str:
+    if p.ui_type == "web":
+        return f"web @ {p.web_port}"
+    return p.ui_type
+
+
+def _print_current_status(cfg: Config) -> None:
+    """Print a compact summary of what is already configured."""
+    provider_info = f"{cfg.llm.provider} / {cfg.llm.model}" if cfg.llm.provider else "not set"
+    active_panels = _all_active_panels(cfg)
+    cp_info = ", ".join(_panel_label(p) for p in active_panels) if active_panels else "not configured"
+    connector_info = (
+        ", ".join(c.name for c in cfg.connectors) if cfg.connectors else "none"
+    )
+    google_info = (
+        "[green]✓ configured[/green]" if cfg.integrations.google.client_id
+        else "[dim]not configured[/dim]"
+    )
+    shell_info = "[green]enabled[/green]" if cfg.tools.shell_enabled else "[dim]disabled[/dim]"
+
+    console.print(
+        "\n[bold]Current configuration[/bold]\n"
+        f"  AI Provider    : {provider_info}\n"
+        f"  Control Panel  : {cp_info}\n"
+        f"  Connectors     : {connector_info}\n"
+        f"  Google Workspace: {google_info}\n"
+        f"  Shell tool     : {shell_info}\n"
+    )
+
+
+def _pick_steps(cfg: Config) -> set:
+    """Let the user pick sections to update via a loop — Enter selects, loop until Done."""
+    selected: set = set()
+
+    def _label(step_id: str) -> str:
+        """Build a display label showing current value + whether already queued."""
+        tag = " [green]✓ queued[/green]" if step_id in selected else ""
+        if step_id == "llm":
+            info = f"{cfg.llm.provider} / {cfg.llm.model}" if cfg.llm.provider else "not set"
+            return f"AI Provider          [{info}]{tag}"
+        if step_id == "control_panel":
+            active = _all_active_panels(cfg)
+            info = ", ".join(_panel_label(p) for p in active) if active else "not configured"
+            return f"Control Panel        [{info}]{tag}"
+        if step_id == "connectors":
+            info = f"{len(cfg.connectors)} configured"
+            return f"Message Connectors   [{info}]{tag}"
+        if step_id == "integrations":
+            info = "Google ✓" if cfg.integrations.google.client_id else "none"
+            return f"Integrations         [{info}]{tag}"
+        if step_id == "tools":
+            info = "shell on" if cfg.tools.shell_enabled else "shell off"
+            return f"Tools & Security     [{info}]{tag}"
+        return step_id
+
+    _ALL = ["llm", "control_panel", "connectors", "integrations", "tools"]
+
+    while True:
+        choices = [Choice(_label(s), value=s) for s in _ALL]
+        choices.append(Choice(
+            "Done — save and continue" if selected else "Done — no changes",
+            value="done",
+        ))
+
+        pick = questionary.select(
+            "Select a section to configure (Enter to choose, repeat to add more):",
+            choices=choices,
+        ).ask()
+
+        if pick is None or pick == "done":
+            break
+
+        if pick in selected:
+            # Toggle off if picked again
+            selected.discard(pick)
+            console.print(f"[dim]  → {pick} removed from queue.[/dim]")
+        else:
+            selected.add(pick)
+            console.print(f"[green]  → {pick} queued.[/green]")
+
+    return selected
+
+
+def _step_control_panel(cfg: Config, is_update: bool, out_tokens: dict) -> None:
+    """Configure control panels.  Multiple panels can run simultaneously."""
+    from umabot.config.schema import ControlPanelConfig as _CPConfig
+
+    # Collect all currently active panels for display
+    all_active = _all_active_panels(cfg)
+
+    if is_update and all_active:
+        active_labels = ", ".join(
+            f"{p.ui_type}{'@'+str(p.web_port) if p.ui_type=='web' else ''}"
+            for p in all_active
+        )
+        console.print(f"  Active panels: [cyan]{active_labels}[/cyan]\n")
+
+    # Loop — keep adding panels until user is done
+    while True:
+        action = questionary.select(
+            "Control panel action:",
+            choices=[
+                Choice("Add web UI (local browser)",        value="web"),
+                Choice("Add Telegram bot panel",            value="telegram"),
+                Choice("Add Discord bot panel",             value="discord"),
+                Choice("Remove a panel",                    value="remove"),
+                Choice("Done",                              value="done"),
+            ],
+        ).ask()
+
+        if action is None or action == "done":
+            break
+
+        if action == "remove":
+            if not all_active:
+                console.print("[yellow]No panels configured.[/yellow]")
+                continue
+            labels = [
+                f"{p.ui_type}{'@'+str(p.web_port) if p.ui_type=='web' else ''}"
+                for p in all_active
+            ]
+            idx = questionary.select(
+                "Which panel to remove?",
+                choices=[Choice(l, value=i) for i, l in enumerate(labels)],
+            ).ask()
+            if idx is not None:
+                removed = all_active.pop(idx)
+                console.print(f"[yellow]  → Removed {removed.ui_type} panel.[/yellow]")
+            continue
+
+        if action == "web":
+            existing_web = next((p for p in all_active if p.ui_type == "web"), None)
+            default_port = str(existing_web.web_port if existing_web else 8080)
+            port_str = questionary.text("Port for the web panel:", default=default_port).ask()
+            try:
+                port = int(port_str or default_port)
+            except ValueError:
+                port = 8080
+            if existing_web:
+                existing_web.web_port = port
+                console.print(f"[green]  → Web panel updated → http://127.0.0.1:{port}[/green]")
+            else:
+                panel = _CPConfig(enabled=True, ui_type="web", web_host="127.0.0.1", web_port=port)
+                all_active.append(panel)
+                console.print(f"[green]  → Web panel added → http://127.0.0.1:{port}[/green]")
+
+        elif action == "telegram":
+            console.print("\n[cyan]━━━ Telegram Control Panel ━━━[/cyan]")
+            console.print("We'll discover your chat ID by having you send a message to your bot.\n")
+            from umabot.cli.control_panel_setup import _get_bot_token_and_discover_chat_id
+            result = asyncio.run(_get_bot_token_and_discover_chat_id())
+            if result:
+                token, chat_id, bot_username = result
+                out_tokens["telegram"] = token
+                connector_name = f"control_panel_tg_{len([p for p in all_active if p.ui_type=='telegram'])+1}"
+                panel = _CPConfig(
+                    enabled=True, ui_type="telegram",
+                    connector=connector_name, chat_id=chat_id,
+                )
+                all_active.append(panel)
+                if not any(c.name == connector_name for c in cfg.connectors):
+                    cfg.connectors.append(ConnectorConfig(
+                        name=connector_name, type="telegram_bot", token=token,
+                    ))
+                console.print(f"[green]  → Telegram panel added (@{bot_username})[/green]")
+            else:
+                console.print("[yellow]  → Telegram setup skipped.[/yellow]")
+
+        elif action == "discord":
+            console.print("\n[cyan]━━━ Discord Control Panel ━━━[/cyan]")
+            token = _prompt_required_secret("Discord bot token:")
+            chat_id = questionary.text("Discord channel ID:").ask() or ""
+            out_tokens["discord"] = token
+            connector_name = f"control_panel_discord_{len([p for p in all_active if p.ui_type=='discord'])+1}"
+            panel = _CPConfig(
+                enabled=True, ui_type="discord",
+                connector=connector_name, chat_id=chat_id,
+            )
+            all_active.append(panel)
+            if not any(c.name == connector_name for c in cfg.connectors):
+                cfg.connectors.append(ConnectorConfig(
+                    name=connector_name, type="discord", token=token,
+                ))
+            console.print("[green]  → Discord panel added.[/green]")
+
+    # Write back: first panel → primary (legacy compat), rest → control_panels list
+    if all_active:
+        cfg.control_panel = all_active[0]
+        cfg.control_panels = all_active[1:]
+    else:
+        cfg.control_panel.enabled = False
+        cfg.control_panels = []
+
+    if all_active:
+        summary = ", ".join(
+            f"{p.ui_type}{'@'+str(p.web_port) if p.ui_type=='web' else ''}"
+            for p in all_active
+        )
+        console.print(f"[green]✓ Active control panels: {summary}[/green]")
+
+
+def _setup_integrations_interactive(cfg: Config) -> None:
+    """Interactive integrations setup — credentials + live OAuth login."""
+    while True:
+        choice = questionary.select(
+            "Add an integration:",
+            choices=[
+                questionary.Choice("Google Workspace (Gmail, Calendar, Tasks)", value="google"),
+                questionary.Choice("Done", value="done"),
+            ],
+        ).ask()
+
+        if choice == "done":
+            break
+
+        if choice == "google":
+            _setup_google_workspace(cfg)
+
+
+def _setup_google_workspace(cfg: Config) -> None:
+    """Walk the user through Google Workspace credential setup and OAuth login."""
+    from umabot.cli.google import _parse_client_secret_json, run_oauth_login, _OAUTH_CALLBACK_PORT
+    from umabot.storage import Database
+
+    # ── Step 1: Credentials ───────────────────────────────────────────────
+    console.print("\n[bold cyan]━━━ Google Workspace — Step 1 of 3: Credentials ━━━[/bold cyan]\n")
+    console.print(
+        "You need a Google Cloud OAuth 2.0 credential.  Quick steps:\n\n"
+        "  1. Open [link]https://console.cloud.google.com/apis/credentials[/link]\n"
+        "  2. Enable APIs: [bold]Gmail API[/bold], [bold]Google Calendar API[/bold], [bold]Tasks API[/bold]\n"
+        "  3. Create Credentials → OAuth 2.0 Client ID → [bold]Web application[/bold]\n"
+        f"  4. Add Authorized redirect URI:  [cyan]http://127.0.0.1:{_OAUTH_CALLBACK_PORT}/callback[/cyan]\n"
+        "  5. Download [bold]client_secret.json[/bold]  OR  copy the values\n"
+    )
+
+    json_path = questionary.text(
+        "Path to client_secret.json (or press Enter to type manually):"
+    ).ask() or ""
+
+    client_id = ""
+    client_secret = ""
+
+    if json_path.strip():
+        client_id, client_secret = _parse_client_secret_json(json_path.strip())
+        if not client_id:
+            console.print(f"[red]✗ Could not parse {json_path}. Skipping Google setup.[/red]\n")
+            return
+        console.print(f"[green]✓ Credentials parsed from {json_path}[/green]")
+    else:
+        client_id = questionary.text("Client ID:").ask() or ""
+        client_secret = questionary.password("Client Secret (hidden):").ask() or ""
+
+    if not client_id or not client_secret:
+        console.print("[yellow]Skipping Google Workspace — credentials not provided.[/yellow]\n")
+        return
+
+    cfg.integrations.google.client_id = client_id
+    cfg.integrations.google.client_secret = client_secret
+    console.print("[green]✓ Credentials saved to config.[/green]")
+
+    # ── Step 2: Install deps if needed ────────────────────────────────────
+    console.print("\n[bold cyan]━━━ Google Workspace — Step 2 of 3: Dependencies ━━━[/bold cyan]\n")
+    try:
+        import googleapiclient  # noqa: F401
+        console.print("[green]✓ Google API libraries already installed.[/green]")
+    except ImportError:
+        console.print("[yellow]Installing Google API libraries...[/yellow]")
+        import subprocess, sys
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q",
+             "google-api-python-client>=2.100.0",
+             "google-auth-oauthlib>=1.1.0",
+             "google-auth-httplib2>=0.2.0"],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            console.print(
+                "[red]✗ Failed to install Google libraries.[/red]\n"
+                f"[dim]{result.stderr.decode()[:200]}[/dim]\n"
+                "[yellow]You can install manually: pip install 'umabot[google]'[/yellow]"
+            )
+            return
+        console.print("[green]✓ Google API libraries installed.[/green]")
+
+    # ── Step 3: OAuth login ───────────────────────────────────────────────
+    console.print("\n[bold cyan]━━━ Google Workspace — Step 3 of 3: Authorise ━━━[/bold cyan]\n")
+    do_login = questionary.confirm(
+        "Open browser now to authorise Google access?", default=True
+    ).ask()
+
+    if not do_login:
+        console.print(
+            "[yellow]Skipping login — run [bold]umabot google login[/bold] later to authorise.[/yellow]\n"
+        )
+        return
+
+    # Save config first so the DB path is resolved
+    from umabot.config.loader import save_config as _save_cfg
+    from pathlib import Path as _Path
+    _cfg_path = str(_Path.home() / ".umabot" / "config.yaml")
+    _save_cfg(cfg, _cfg_path)
+
+    db = Database(cfg.storage.db_path)
+    try:
+        ok = run_oauth_login(client_id, client_secret, db)
+    finally:
+        db.close()
+
+    if ok:
+        # ── Show status inline ─────────────────────────────────────────
+        console.print("\n[bold cyan]━━━ Google Workspace — Status ━━━[/bold cyan]")
+        from umabot.tools.google.auth import get_credentials
+        try:
+            creds = get_credentials(client_id, client_secret, Database(cfg.storage.db_path))
+            if creds and creds.valid:
+                console.print("  Token  : [green]✅  valid[/green]")
+            elif creds and creds.expired:
+                console.print("  Token  : [yellow]⚠  expired (will auto-refresh on next use)[/yellow]")
+            else:
+                console.print("  Token  : [red]✗  invalid[/red]")
+        except Exception:
+            console.print("  Token  : [green]stored[/green]")
+        console.print()
 
 
 def _get_models_for_provider(provider: str) -> list:
@@ -465,6 +741,32 @@ async def _do_telegram_qr_auth(api_id: str, api_hash: str, connector_name: str, 
         console.print(f"[red]Error during authentication: {e}[/red]")
         await client.disconnect()
         return None
+
+
+def _ensure_agent_context_file(config_dir: Path) -> None:
+    """Copy the AGENT.md template into the user's config dir if it doesn't exist yet."""
+    dest = config_dir / "AGENT.md"
+    if dest.exists():
+        return
+    template = Path(__file__).parent.parent.parent / "AGENT.md.template"
+    if template.exists():
+        dest.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        # Fallback: write a minimal stub inline
+        dest.write_text(
+            "# Agent Context\n\n"
+            "Edit this file to give your assistant standing instructions, persona,\n"
+            "personal facts, or domain knowledge. It is injected into every request.\n\n"
+            "## About me\n\n"
+            "## Preferences\n\n"
+            "## Standing rules\n\n"
+            "## Domain context\n",
+            encoding="utf-8",
+        )
+    console.print(
+        f"[dim]  → Created agent context file: {dest}\n"
+        "     Edit it to customise your assistant's behaviour.[/dim]"
+    )
 
 
 def _install_system_daemon(config_file: Path) -> None:
