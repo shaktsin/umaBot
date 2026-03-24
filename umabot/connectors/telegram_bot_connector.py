@@ -10,15 +10,23 @@ import os
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 from aiohttp import ClientSession, WSMsgType
 
 from umabot.connectors.telegram_format import markdown_to_telegram_html, split_message
-
+from umabot.connectors.telegram_resilience import (
+    ChatCircuitBreakers,
+    TelegramRateLimiter,
+    backoff_delay,
+)
 from umabot.config import load_config
 from umabot.connectors.base import BaseConnector, ConnectorStatus
 
 logger = logging.getLogger("umabot.connectors.telegram_bot")
+
+# Max send attempts per message chunk before giving up
+_SEND_MAX_RETRIES = 3
 
 
 class TelegramBotConnector(BaseConnector):
@@ -26,6 +34,12 @@ class TelegramBotConnector(BaseConnector):
     Telegram Bot API connector.
 
     Polls Telegram Bot API for updates and forwards messages to gateway via WebSocket.
+
+    Resilience features:
+      - Per-chat + global rate limiting (TelegramRateLimiter)
+      - Retry with backoff on 429 / send failure
+      - Per-chat circuit breaker (stops hammering a broken chat)
+      - Exponential backoff on reconnect
     """
 
     def __init__(
@@ -43,58 +57,64 @@ class TelegramBotConnector(BaseConnector):
         self._connected = False
         self._last_message_at: Optional[str] = None
 
+        # Resilience
+        self._rate_limiter = TelegramRateLimiter()
+        self._circuit_breakers = ChatCircuitBreakers(
+            failure_threshold=5, cooldown_seconds=300.0
+        )
+
     async def run(self) -> None:
-        """Main connector loop."""
-        logger.info(f"Starting Telegram Bot connector: {self.name}")
+        """Main connector loop with exponential backoff on reconnect."""
+        logger.info("Starting Telegram Bot connector: %s", self.name)
+        attempt = 0
         async with ClientSession() as session:
             while not self._stop.is_set():
                 try:
                     async with session.ws_connect(self.ws_url) as ws:
-                        # Send hello message to gateway
                         await ws.send_json(
                             {
                                 "type": "hello",
                                 "token": self.ws_token,
                                 "connector": self.name,
                                 "channel": "telegram",
-                                "mode": "channel",  # Regular message connector
+                                "mode": "channel",
                             }
                         )
-
-                        # Wait for ready confirmation
                         ready = await ws.receive_json()
                         if ready.get("type") != "ready":
                             raise RuntimeError("WebSocket handshake failed")
 
                         self._connected = True
-                        logger.info(f"Telegram Bot connector {self.name} connected to gateway")
+                        attempt = 0  # reset backoff on successful connect
+                        logger.info("Telegram Bot connector %s connected to gateway", self.name)
 
-                        # Run polling and receiving loops concurrently
                         poll_task = asyncio.create_task(self._poll_loop(ws))
                         recv_task = asyncio.create_task(self._recv_loop(ws))
 
                         done, pending = await asyncio.wait(
                             [poll_task, recv_task], return_when=asyncio.FIRST_COMPLETED
                         )
-
                         for task in pending:
                             task.cancel()
                         await asyncio.gather(*pending, return_exceptions=True)
                         await asyncio.gather(*done, return_exceptions=True)
+
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    delay = backoff_delay(attempt)
+                    attempt += 1
                     logger.warning(
-                        "Connector %s failed to connect/run (%s). Retrying in 2s...",
-                        self.name,
-                        exc,
+                        "Connector %s failed (%s). Reconnecting in %.1fs (attempt %d)...",
+                        self.name, exc, delay, attempt,
                     )
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(delay)
                 finally:
                     self._connected = False
 
     async def _poll_loop(self, ws) -> None:
         """Poll Telegram Bot API for updates."""
+        poll_attempt = 0
         while not self._stop.is_set():
             params = {"timeout": 20}
             if self._offset is not None:
@@ -102,9 +122,12 @@ class TelegramBotConnector(BaseConnector):
 
             try:
                 data = await asyncio.to_thread(self._get, "getUpdates", params)
+                poll_attempt = 0  # reset on success
             except Exception as exc:
-                logger.warning(f"Telegram polling error: {exc}")
-                await asyncio.sleep(2)
+                delay = backoff_delay(poll_attempt)
+                poll_attempt += 1
+                logger.warning("Telegram polling error (%s). Retrying in %.1fs...", exc, delay)
+                await asyncio.sleep(delay)
                 continue
 
             from datetime import datetime
@@ -126,7 +149,6 @@ class TelegramBotConnector(BaseConnector):
                 user_id = str(message.get("from", {}).get("id", ""))
                 text = message.get("text", "")
 
-                # Forward to gateway
                 await ws.send_json(
                     {
                         "type": "event",
@@ -135,7 +157,6 @@ class TelegramBotConnector(BaseConnector):
                         "text": text,
                     }
                 )
-
                 self._last_message_at = datetime.utcnow().isoformat()
                 logger.debug("Forwarded Telegram message to gateway")
 
@@ -146,7 +167,6 @@ class TelegramBotConnector(BaseConnector):
         user_id = str(callback.get("from", {}).get("id", ""))
         data = callback.get("data", "")
 
-        # Expected format: "confirm:YES:<token>" or "confirm:NO:<token>"
         if not data.startswith("confirm:"):
             return
 
@@ -156,17 +176,14 @@ class TelegramBotConnector(BaseConnector):
         _, verdict, token = parts
         verdict = verdict.upper()
 
-        # Acknowledge the button press immediately (removes the loading spinner)
+        # Acknowledge the button press (removes loading spinner)
         try:
             await asyncio.to_thread(
-                self._post,
-                "answerCallbackQuery",
-                {"callback_query_id": callback_id},
+                self._post, "answerCallbackQuery", {"callback_query_id": callback_id}
             )
         except Exception as exc:
             logger.warning("answerCallbackQuery failed: %s", exc)
 
-        # Forward as a regular text event — policy engine handles "YES <token>"
         await ws.send_json(
             {
                 "type": "event",
@@ -197,15 +214,80 @@ class TelegramBotConnector(BaseConnector):
                 logger.warning("WebSocket closed or error")
                 break
 
+    async def _send_message(self, chat_id: str, text: str) -> None:
+        """Send message with rate limiting, retry on 429, and circuit breaker."""
+        if not chat_id:
+            return
+
+        cb = self._circuit_breakers.get(chat_id)
+        if cb.is_open():
+            logger.warning("Circuit open for chat_id=%s — dropping message", chat_id)
+            return
+
+        html_text = markdown_to_telegram_html(text)
+        chunks = split_message(html_text)
+
+        for chunk in chunks:
+            await self._send_chunk(chat_id, chunk, cb)
+
+    async def _send_chunk(self, chat_id: str, chunk: str, cb) -> None:
+        """Send one chunk with rate limiting and retry on 429."""
+        for attempt in range(_SEND_MAX_RETRIES):
+            await self._rate_limiter.acquire(chat_id)
+            try:
+                await asyncio.to_thread(
+                    self._post,
+                    "sendMessage",
+                    {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"},
+                )
+                cb.record_success()
+                logger.debug("Sent Telegram message chat_id=%s", chat_id)
+                return
+            except HTTPError as exc:
+                retry_after = _parse_retry_after(exc)
+                if retry_after is not None:
+                    logger.warning(
+                        "Telegram 429 for chat_id=%s — waiting %.0fs (attempt %d/%d)",
+                        chat_id, retry_after, attempt + 1, _SEND_MAX_RETRIES,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                # Non-429 HTTP error — try plain text fallback once
+                if attempt == 0:
+                    try:
+                        await asyncio.to_thread(
+                            self._post, "sendMessage", {"chat_id": chat_id, "text": chunk}
+                        )
+                        cb.record_success()
+                        logger.debug("Sent Telegram message (plain fallback) chat_id=%s", chat_id)
+                        return
+                    except Exception as fallback_exc:
+                        logger.warning("Plain fallback also failed: %s", fallback_exc)
+                cb.record_failure()
+                logger.error("Failed to send to chat_id=%s: %s", chat_id, exc)
+                return
+            except Exception as exc:
+                cb.record_failure()
+                logger.error("Failed to send to chat_id=%s: %s", chat_id, exc)
+                return
+
+        cb.record_failure()
+        logger.error("Gave up sending to chat_id=%s after %d attempts", chat_id, _SEND_MAX_RETRIES)
+
     async def _send_confirmation_request(
         self, chat_id: str, tool_name: str, args_preview: str, token: str
     ) -> None:
         """Send a tool approval request with Approve/Deny inline keyboard buttons."""
         if not chat_id:
             return
+
+        cb = self._circuit_breakers.get(chat_id)
+        if cb.is_open():
+            logger.warning("Circuit open for chat_id=%s — dropping confirm_request", chat_id)
+            return
+
         text = f"⚠️ <b>Approval required</b>\nTool: <code>{tool_name}</code>"
         if args_preview:
-            # Trim to keep the message readable
             preview = args_preview[:300] + ("..." if len(args_preview) > 300 else "")
             text += f"\n\nArguments:\n<pre>{preview}</pre>"
 
@@ -217,16 +299,23 @@ class TelegramBotConnector(BaseConnector):
                 ]
             ]
         }
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "reply_markup": json.dumps(keyboard),
-        }
+
+        await self._rate_limiter.acquire(chat_id)
         try:
-            await asyncio.to_thread(self._post, "sendMessage", payload)
-            logger.debug("Sent confirmation request with inline keyboard chat_id=%s tool=%s", chat_id, tool_name)
+            await asyncio.to_thread(
+                self._post,
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "reply_markup": json.dumps(keyboard),
+                },
+            )
+            cb.record_success()
+            logger.debug("Sent confirmation request with inline keyboard chat_id=%s", chat_id)
         except Exception as exc:
+            cb.record_failure()
             logger.error("Failed to send confirmation request: %s", exc)
             # Fallback: plain text without buttons
             await self._send_message(
@@ -234,37 +323,13 @@ class TelegramBotConnector(BaseConnector):
                 f"⚠️ Approval required: {tool_name}\n\nReply YES to approve or NO to deny.",
             )
 
-    async def _send_message(self, chat_id: str, text: str) -> None:
-        """Send message to Telegram chat with formatting."""
-        if not chat_id:
-            return
-
-        html_text = markdown_to_telegram_html(text)
-        chunks = split_message(html_text)
-
-        for chunk in chunks:
-            payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"}
-            try:
-                await asyncio.to_thread(self._post, "sendMessage", payload)
-                logger.debug("Sent Telegram message")
-            except Exception:
-                # Fallback: send without parse_mode in case HTML is malformed
-                fallback_payload = {"chat_id": chat_id, "text": chunk}
-                try:
-                    await asyncio.to_thread(self._post, "sendMessage", fallback_payload)
-                    logger.debug("Sent Telegram message (plain fallback)")
-                except Exception as exc:
-                    logger.error("Failed to send Telegram message: %s", exc)
-
     def _get(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Make GET request to Telegram Bot API."""
         url = f"https://api.telegram.org/bot{self.token}/{method}?{urlencode(params)}"
         req = Request(url, headers={"User-Agent": "umabot/0.1"})
         with urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def _post(self, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Make POST request to Telegram Bot API."""
         url = f"https://api.telegram.org/bot{self.token}/{method}"
         data = json.dumps(payload).encode("utf-8")
         req = Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -272,7 +337,6 @@ class TelegramBotConnector(BaseConnector):
             return json.loads(resp.read().decode("utf-8"))
 
     async def health_check(self) -> ConnectorStatus:
-        """Return current health status."""
         return ConnectorStatus(
             name=self.name,
             channel="telegram",
@@ -282,17 +346,30 @@ class TelegramBotConnector(BaseConnector):
         )
 
 
+def _parse_retry_after(exc: HTTPError) -> Optional[float]:
+    """Extract retry_after seconds from a Telegram 429 HTTPError body.
+
+    Telegram returns: {"ok": false, "error_code": 429,
+                       "parameters": {"retry_after": 30}}
+    """
+    if exc.code != 429:
+        return None
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+        data = json.loads(body)
+        return float(data["parameters"]["retry_after"])
+    except Exception:
+        return 30.0  # safe default
+
+
 def _default_ws_url(cfg) -> str:
-    """Build default WebSocket URL from config."""
     host = cfg.runtime.ws_host
     port = cfg.runtime.ws_port
     return f"ws://{host}:{port}/ws"
 
 
 def _find_connector(cfg, connector_name: str):
-    """Find connector configuration by name."""
     for conn in cfg.connectors:
-        # Support both dict and object formats
         if isinstance(conn, dict):
             if conn.get("name") == connector_name:
                 return conn
@@ -320,61 +397,42 @@ def _connector_env_token(connector_name: str) -> Optional[str]:
 
 
 def main() -> None:
-    """CLI entry point for Telegram Bot connector."""
-    parser = argparse.ArgumentParser(
-        description="Telegram Bot connector for UMA BOT"
-    )
+    parser = argparse.ArgumentParser(description="Telegram Bot connector for UMA BOT")
     parser.add_argument("--config", dest="config", default=None)
-    parser.add_argument("--connector", dest="connector", required=True, help="Connector name from config")
-    parser.add_argument("--token", dest="token", default=None, help="Override Telegram bot token")
+    parser.add_argument("--connector", dest="connector", required=True)
+    parser.add_argument("--token", dest="token", default=None)
     parser.add_argument("--ws-url", dest="ws_url", default=None)
     parser.add_argument("--ws-token", dest="ws_token", default=None)
     parser.add_argument("--log-level", dest="log_level", default=None)
     args = parser.parse_args()
 
     log_level = (args.log_level or "INFO").upper()
-    logging.basicConfig(
-        level=log_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    )
+    logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    # Load configuration
     cfg, _ = load_config(config_path=args.config)
-
-    # Find connector config
     connector_cfg = _find_connector(cfg, args.connector)
     if not connector_cfg:
         raise SystemExit(f"Connector '{args.connector}' not found in configuration")
 
-    # Get token (support both dict and object formats)
     if isinstance(connector_cfg, dict):
         token = args.token or connector_cfg.get("token")
     else:
         token = args.token or connector_cfg.token
 
-    # Fallback to connector/env/keychain-loaded token
     if not token:
         token = _connector_env_token(args.connector) or getattr(cfg.telegram, "token", None)
 
     if not token:
-        raise SystemExit(
-            "No token configured for connector "
-            f"'{args.connector}'. Set connector.token in config.yaml or export "
-            f"UMABOT_CONNECTOR_{''.join(ch if ch.isalnum() else '_' for ch in args.connector.strip().upper())}_TOKEN."
-        )
+        raise SystemExit(f"No token configured for connector '{args.connector}'.")
 
-    # Get WebSocket details
     ws_token = args.ws_token or cfg.runtime.ws_token
     if not ws_token:
         raise SystemExit("WebSocket token not configured (UMABOT_WS_TOKEN)")
 
     ws_url = args.ws_url or _default_ws_url(cfg)
 
-    # Create and run connector
     connector = TelegramBotConnector(
-        name=args.connector,
-        token=token,
-        ws_url=ws_url,
-        ws_token=ws_token,
+        name=args.connector, token=token, ws_url=ws_url, ws_token=ws_token
     )
 
     try:
@@ -382,7 +440,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Connector stopped by user")
     except Exception as exc:
-        logger.error(f"Connector failed: {exc}", exc_info=True)
+        logger.error("Connector failed: %s", exc, exc_info=True)
         raise SystemExit(1)
 
 

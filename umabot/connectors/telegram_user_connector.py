@@ -10,9 +10,15 @@ from typing import Optional
 
 from aiohttp import ClientSession, WSMsgType
 from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 from umabot.connectors.telegram_format import markdown_to_telegram_html, split_message
+from umabot.connectors.telegram_resilience import (
+    ChatCircuitBreakers,
+    TelegramRateLimiter,
+    backoff_delay,
+)
 import qrcode
 
 from umabot.config import load_config
@@ -55,9 +61,16 @@ class TelegramUserConnector(BaseConnector):
         self._connected = False
         self._last_message_at: Optional[str] = None
 
+        # Resilience
+        self._rate_limiter = TelegramRateLimiter()
+        self._circuit_breakers = ChatCircuitBreakers(
+            failure_threshold=5, cooldown_seconds=300.0
+        )
+
     async def run(self) -> None:
-        """Main connector loop."""
-        logger.info(f"Starting Telegram User connector: {self.name}")
+        """Main connector loop with exponential backoff on reconnect."""
+        logger.info("Starting Telegram User connector: %s", self.name)
+        attempt = 0
         async with ClientSession() as http_session:
             while not self._stop.is_set():
                 client = None
@@ -65,7 +78,6 @@ class TelegramUserConnector(BaseConnector):
                     async with http_session.ws_connect(self.ws_url) as ws:
                         self._ws = ws
 
-                        # Send hello message to gateway
                         await ws.send_json(
                             {
                                 "type": "hello",
@@ -75,63 +87,65 @@ class TelegramUserConnector(BaseConnector):
                                 "mode": "channel",
                             }
                         )
-
-                        # Wait for ready confirmation
                         ready = await ws.receive_json()
                         if ready.get("type") != "ready":
                             raise RuntimeError("WebSocket handshake failed")
 
-                        logger.info(f"WebSocket connected for connector: {self.name}")
+                        logger.info("WebSocket connected for connector: %s", self.name)
 
-                        # Create Telethon client
                         session = StringSession(self.session_string)
                         client = TelegramClient(session, self.api_id, self.api_hash)
                         await client.connect()
 
-                        # Check authorization
                         if not await client.is_user_authorized():
                             if not self.allow_login:
                                 raise SystemExit(
                                     "Telegram user session not authorized. Run with --login to complete first-time auth."
                                 )
-
-                            # QR code login (no phone required!)
-                            logger.info("Starting QR code login - scan the QR code below with Telegram mobile app")
+                            logger.info("Starting QR code login")
                             qr_login = await client.qr_login()
                             _print_qr(qr_login.url)
                             print("\n📱 Open Telegram on your phone → Settings → Devices → Link Desktop Device")
                             print("   Scan the QR code above to log in\n")
                             await qr_login.wait()
-                            logger.info(f"✓ QR login successful for connector: {self.name}")
+                            logger.info("QR login successful for connector: %s", self.name)
 
-                        # Persist session for next run
                         _persist_session(self.db_path, self.name, client.session.save())
-
-                        # Register event handler for new messages
                         client.add_event_handler(
                             self._on_new_message, events.NewMessage(incoming=True)
                         )
 
                         self._connected = True
-                        logger.info(f"Telegram User connector {self.name} ready")
+                        attempt = 0  # reset backoff on successful connect
+                        logger.info("Telegram User connector %s ready", self.name)
 
-                        # Run recv loop (outbound sends) alongside Telethon client
                         recv_task = asyncio.create_task(self._recv_loop(ws, client))
                         try:
                             await client.run_until_disconnected()
                         finally:
                             recv_task.cancel()
+
                 except asyncio.CancelledError:
                     raise
                 except SystemExit:
                     raise
-                except Exception as exc:
+                except FloodWaitError as exc:
+                    # Telegram is flood-controlling the account — must wait the full period
+                    wait = exc.seconds + 2
+                    attempt += 1
                     logger.warning(
-                        "Connector %s failed to connect/run (%s). Retrying in 2s...",
-                        self.name,
-                        exc,
+                        "Connector %s FloodWait %ds — waiting before reconnect (attempt %d)",
+                        self.name, wait, attempt,
                     )
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(wait)
+                except Exception as exc:
+                    delay = backoff_delay(attempt)
+                    attempt += 1
+                    logger.warning(
+                        "Connector %s failed (%s). Reconnecting in %.1fs (attempt %d)...",
+                        self.name, exc, delay, attempt,
+                    )
+                    await asyncio.sleep(delay)
                 finally:
                     self._connected = False
                     self._ws = None
@@ -179,24 +193,62 @@ class TelegramUserConnector(BaseConnector):
             pass
 
     async def _send_message(self, client: TelegramClient, chat_id: str, text: str) -> None:
-        """Send formatted message via Telethon."""
+        """Send formatted message via Telethon with rate limiting, FloodWait handling,
+        and circuit breaker."""
         if not chat_id:
+            return
+
+        cb = self._circuit_breakers.get(chat_id)
+        if cb.is_open():
+            logger.warning("Circuit open for chat_id=%s — dropping message", chat_id)
             return
 
         html_text = markdown_to_telegram_html(text)
         chunks = split_message(html_text)
 
         for chunk in chunks:
+            await self._send_chunk(client, chat_id, chunk, cb)
+
+    async def _send_chunk(
+        self, client: TelegramClient, chat_id: str, chunk: str, cb
+    ) -> None:
+        """Send one chunk with rate limiting, FloodWait retry, and circuit breaker."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            await self._rate_limiter.acquire(chat_id)
             try:
                 await client.send_message(int(chat_id), chunk, parse_mode="html")
-                logger.debug("Sent Telethon message")
+                cb.record_success()
+                logger.debug("Sent Telethon message chat_id=%s", chat_id)
+                return
+            except FloodWaitError as exc:
+                wait = exc.seconds + 2
+                logger.warning(
+                    "FloodWait %ds for chat_id=%s (attempt %d/%d)",
+                    wait, chat_id, attempt + 1, max_retries,
+                )
+                await asyncio.sleep(wait)
+                # Don't count FloodWait as a circuit-breaker failure — it's expected
+                continue
             except Exception:
-                # Fallback: send without formatting
+                # Fallback: plain text
                 try:
                     await client.send_message(int(chat_id), chunk)
-                    logger.debug("Sent Telethon message (plain fallback)")
+                    cb.record_success()
+                    logger.debug("Sent Telethon message (plain fallback) chat_id=%s", chat_id)
+                    return
+                except FloodWaitError as exc:
+                    wait = exc.seconds + 2
+                    logger.warning("FloodWait %ds on plain fallback", wait)
+                    await asyncio.sleep(wait)
+                    continue
                 except Exception as exc:
-                    logger.error("Failed to send Telethon message: %s", exc)
+                    cb.record_failure()
+                    logger.error("Failed to send Telethon message chat_id=%s: %s", chat_id, exc)
+                    return
+
+        cb.record_failure()
+        logger.error("Gave up sending to chat_id=%s after %d attempts", chat_id, max_retries)
 
     async def health_check(self) -> ConnectorStatus:
         """Return current health status."""

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from umabot.llm.base import LLMClient, LLMResponse, compress_tool_output
@@ -62,7 +63,7 @@ class SpawnedAgent:
             user_content += f"\n\nContext:\n{self.context}"
 
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": _inject_date(self.system_prompt)},
             {"role": "user", "content": user_content},
         ]
 
@@ -144,6 +145,31 @@ class SpawnedAgent:
                 }
             )
         return specs
+
+
+_DATE_MARKER = "Current date/time:"
+
+
+def _inject_date(system_prompt: str) -> str:
+    """Prepend current date block to the system prompt if not already present.
+
+    This ensures every spawned agent knows the real current date regardless of
+    whether the orchestrator included it in the generated system_prompt arg.
+    """
+    if _DATE_MARKER in system_prompt:
+        return system_prompt  # orchestrator already included it
+
+    now = datetime.now(timezone.utc)
+    week_start = now.date() - timedelta(days=now.weekday())  # Monday
+    week_end = week_start + timedelta(days=6)                # Sunday
+    date_block = (
+        f"Current date/time: {now.strftime('%Y-%m-%dT%H:%M:%SZ')} (UTC)\n"
+        f"Current local date: {now.strftime('%Y-%m-%d')}  Day: {now.strftime('%A')}\n"
+        f"This week: {week_start.isoformat()} (Mon) → {week_end.isoformat()} (Sun)\n"
+        "When the user refers to relative dates (today, this week, tomorrow, next Monday)\n"
+        "compute them from the current date above and pass ISO 8601 timestamps to tools.\n\n"
+    )
+    return date_block + system_prompt
 
 
 def _trim_messages(

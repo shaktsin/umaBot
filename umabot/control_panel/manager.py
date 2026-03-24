@@ -1,10 +1,10 @@
-"""Control panel manager for owner interaction."""
+"""Control panel manager — supports multiple simultaneous panels."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import List, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from umabot.gateway import Gateway
@@ -14,131 +14,120 @@ logger = logging.getLogger("umabot.control_panel")
 
 
 class ControlPanelManager:
+    """Manages one or more owner control panel interfaces.
+
+    All enabled panels receive every notification simultaneously.  The web panel
+    is routed through the hub; messaging panels (telegram, discord) use their
+    connector's send path.
+
+    ``panels`` is the authoritative list.  It is built from:
+      - ``config.control_panels``  (explicit list in config.yaml)
+      - ``config.control_panel``   (legacy single-panel field, appended if enabled)
     """
-    Manages the owner control panel interface.
 
-    The control panel is the owner's private interface for:
-    - Receiving notifications
-    - Confirming sensitive actions
-    - Managing the assistant
-
-    This is separate from regular message connectors that handle external user messages.
-    """
-
-    def __init__(self, config: "ControlPanelConfig", gateway: "Gateway"):
-        """
-        Initialize control panel manager.
-
-        Args:
-            config: Control panel configuration
-            gateway: Gateway instance for sending messages
-        """
-        self.config = config
+    def __init__(self, config: "ControlPanelConfig", gateway: "Gateway") -> None:
         self.gateway = gateway
-        self._channel = self._determine_channel()
+        # Build the unified panel list from both config sources
+        self.panels: List[ControlPanelConfig] = _build_panel_list(config, gateway.config)
+        # Legacy: expose primary config so existing gateway code that reads
+        # self._control_panel.config still works without changes.
+        self.config = config
 
-    def _determine_channel(self) -> str:
-        """Determine channel type from connector name."""
-        if not self.config.connector:
-            return ""
-
-        # Find connector in gateway config
-        for conn in self.gateway.config.connectors:
-            if (isinstance(conn, dict) and conn.get("name") == self.config.connector) or \
-               (hasattr(conn, "name") and conn.name == self.config.connector):
-                # Extract channel from connector type
-                conn_type = conn.get("type") if isinstance(conn, dict) else conn.type
-                if "telegram" in conn_type:
-                    return "telegram"
-                elif "discord" in conn_type:
-                    return "discord"
-                elif "whatsapp" in conn_type:
-                    return "whatsapp"
-
-        logger.warning(f"Could not determine channel for connector: {self.config.connector}")
-        return ""
+    # ------------------------------------------------------------------
+    # Sending
+    # ------------------------------------------------------------------
 
     async def send_notification(self, message: str) -> None:
-        """
-        Send a notification to the owner via control panel.
+        """Send *message* to every enabled panel."""
+        tasks = [self._send_to_panel(panel, message) for panel in self.panels if panel.enabled]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        Args:
-            message: Notification message to send
-        """
-        if not self.config.enabled:
-            logger.debug("Control panel not enabled, notification not sent")
-            return
-
-        if not self.config.chat_id:
-            logger.warning("Control panel chat_id not configured, cannot send notification")
-            return
-
+    async def _send_to_panel(self, panel: "ControlPanelConfig", message: str) -> None:
         try:
-            await self.gateway.send_message(
-                channel=self._channel,
-                chat_id=self.config.chat_id,
-                text=message,
-                connector=self.config.connector,
-            )
-            logger.debug("Sent notification to control panel")
+            if panel.ui_type == "web":
+                await self.gateway.send_message("web", "admin", message, connector="web-panel")
+            else:
+                channel = _channel_for_panel(panel, self.gateway.config)
+                if channel and panel.chat_id:
+                    await self.gateway.send_message(
+                        channel=channel,
+                        chat_id=panel.chat_id,
+                        text=message,
+                        connector=panel.connector or "",
+                    )
         except Exception as exc:
-            logger.error(f"Failed to send control panel notification: {exc}")
+            logger.error("Failed to send to control panel (type=%s): %s", panel.ui_type, exc)
 
-    async def request_confirmation(
-        self, prompt: str, timeout: int = 300
-    ) -> bool:
-        """
-        Request confirmation from owner for a sensitive action.
+    # ------------------------------------------------------------------
+    # Routing helpers
+    # ------------------------------------------------------------------
 
-        Args:
-            prompt: Confirmation prompt to show owner
-            timeout: Timeout in seconds (default: 5 minutes)
+    def is_control_message(self, channel: str, chat_id: str, connector: str = "") -> bool:
+        """Return True if the message matches any enabled panel."""
+        for panel in self.panels:
+            if not panel.enabled:
+                continue
+            panel_channel = _channel_for_panel(panel, self.gateway.config)
+            if channel != panel_channel:
+                continue
+            if chat_id != panel.chat_id:
+                continue
+            if panel.connector and connector and connector != panel.connector:
+                continue
+            return True
+        return False
 
-        Returns:
-            True if confirmed, False if denied or timeout
-        """
-        if not self.config.enabled:
-            logger.warning("Control panel not enabled, cannot request confirmation")
-            return False
-
-        # Send confirmation request
+    async def request_confirmation(self, prompt: str, timeout: int = 300) -> bool:
         await self.send_notification(prompt)
-
-        # Wait for response (implementation will depend on policy engine integration)
-        # For now, this is a placeholder
-        # In the full implementation, this would:
-        # 1. Generate a confirmation token
-        # 2. Store it in pending confirmations
-        # 3. Wait for the user to respond with the token
-        # 4. Return True/False based on response
-
         logger.warning("Confirmation request not fully implemented yet")
         return False
 
-    def is_control_message(self, channel: str, chat_id: str, connector: str = "") -> bool:
-        """
-        Check if a message is from the control panel.
 
-        Args:
-            channel: Channel type (telegram, discord, etc.)
-            chat_id: Chat ID
-            connector: Optional connector name
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-        Returns:
-            True if this is a control panel message
-        """
-        if not self.config.enabled:
-            return False
+def _build_panel_list(
+    primary: "ControlPanelConfig",
+    config,
+) -> "List[ControlPanelConfig]":
+    """Merge primary + extra panels into a deduplicated list."""
+    panels: list = []
+    seen_types: set = set()
 
-        # Check channel and chat_id match
-        if channel != self._channel:
-            return False
+    def _add(panel: "ControlPanelConfig") -> None:
+        key = (panel.ui_type, panel.chat_id or "", panel.connector or "")
+        if key not in seen_types:
+            seen_types.add(key)
+            panels.append(panel)
 
-        if chat_id != self.config.chat_id:
-            return False
+    # Extra panels first (higher priority / more specific)
+    for p in getattr(config, "control_panels", []):
+        _add(p)
 
-        # If connector is specified in config, also check it matches
-        if self.config.connector and connector:
-            return connector == self.config.connector
+    # Legacy primary
+    if primary and primary.enabled:
+        _add(primary)
 
-        return True
+    return panels
+
+
+def _channel_for_panel(panel: "ControlPanelConfig", config) -> str:
+    """Resolve channel string for a messaging-type panel."""
+    if panel.ui_type == "web":
+        return "web"
+    if not panel.connector:
+        return panel.ui_type  # best-effort fallback
+    for conn in getattr(config, "connectors", []):
+        name = conn.get("name") if isinstance(conn, dict) else getattr(conn, "name", "")
+        if name != panel.connector:
+            continue
+        conn_type = conn.get("type") if isinstance(conn, dict) else getattr(conn, "type", "")
+        if "telegram" in conn_type:
+            return "telegram"
+        if "discord" in conn_type:
+            return "discord"
+        if "whatsapp" in conn_type:
+            return "whatsapp"
+    return panel.ui_type

@@ -5,11 +5,14 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from umabot.agents import DynamicOrchestrator
 from umabot.llm import ClaudeClient, GeminiClient, OpenAIClient
 from umabot.llm.rate_limiter import TokenBucket
 from umabot.policy import PolicyEngine
+from umabot.security import SecurityPolicy, mask_secrets
+from umabot.security.ssrf import check_ssrf, SSRFError
 from umabot.skills import SkillRegistry
 from umabot.storage import Database, Queue
 from umabot.tasks.parser import parse_control_task_request
@@ -60,6 +63,10 @@ class Worker:
 
         self.llm_client = _build_llm_client(config, rate_limiter=self._token_bucket)
 
+        # Security policy layer
+        security_cfg = getattr(config, "security", None)
+        self.security_policy = SecurityPolicy(security_cfg) if security_cfg else None
+
         # Build separate LLM clients for the orchestration system if enabled.
         # Both inherit missing fields (provider, api_key) from the top-level llm config.
         if agents_cfg and agents_cfg.enabled:
@@ -72,6 +79,9 @@ class Worker:
         else:
             self.orchestrator_llm = None
             self.agent_llm = None
+
+        # Load user-defined agent context from AGENT.md (empty string if file absent)
+        self.agent_context = _load_agent_context(getattr(agents_cfg, "context_file", ""))
 
     @property
     def _concurrency(self) -> int:
@@ -148,6 +158,10 @@ class Worker:
                     return
 
             messages = self.db.list_recent_messages(session_id, limit=20)
+
+            # Always prepend the current date so the LLM can resolve relative
+            # date references ("today", "this week", "tomorrow", etc.) correctly.
+            messages = [_date_system_message()] + messages
 
             # Build system messages: skill catalog + active skill instructions.
             # Also set the active skill's resolved env so shell.run and run_script
@@ -248,6 +262,52 @@ class Worker:
             for tool_call in response.tool_calls:
                 arg_count = len(tool_call.arguments) if isinstance(tool_call.arguments, dict) else 0
                 logger.debug("Tool call requested name=%s arg_count=%s", tool_call.name, arg_count)
+
+                # Security layer: evaluate before risk-level policy
+                if self.security_policy:
+                    sec = self.security_policy.evaluate(
+                        tool_call.name,
+                        user_id=chat_id,   # chat_id proxies user identity for single-user chats
+                        connector=connector,
+                    )
+                    if not sec.allowed:
+                        logger.info("Security deny tool=%s reason=%s", tool_call.name, sec.reason)
+                        self.db.add_audit(
+                            "tool_security_denied",
+                            {"tool": tool_call.name, "reason": sec.reason},
+                            chat_id=chat_id,
+                            connector=connector,
+                            decision="denied",
+                        )
+                        await self.send_message(
+                            channel, chat_id,
+                            f"Access denied: {sec.reason}",
+                            connector=connector,
+                        )
+                        return
+
+                # SSRF protection: check url argument for tools that make HTTP requests
+                if self.security_policy and getattr(getattr(self.config, "security", None), "ssrf_protection", True):
+                    url_arg = (tool_call.arguments or {}).get("url", "") if isinstance(tool_call.arguments, dict) else ""
+                    if url_arg:
+                        try:
+                            check_ssrf(url_arg)
+                        except SSRFError as ssrf_exc:
+                            logger.warning("SSRF blocked tool=%s url=%s: %s", tool_call.name, url_arg, ssrf_exc)
+                            self.db.add_audit(
+                                "ssrf_blocked",
+                                {"tool": tool_call.name, "url": url_arg, "reason": str(ssrf_exc)},
+                                chat_id=chat_id,
+                                connector=connector,
+                                decision="blocked",
+                            )
+                            await self.send_message(
+                                channel, chat_id,
+                                f"Request blocked for security reasons: {ssrf_exc}",
+                                connector=connector,
+                            )
+                            return
+
                 decision = self.policy.evaluate(
                     {"name": tool_call.name, "arguments": tool_call.arguments, "id": tool_call.id},
                     allowed_tools,
@@ -277,7 +337,10 @@ class Worker:
                         await self.send_control_message(channel, chat_id, prompt)
                     self.db.add_audit(
                         "tool_confirmation_requested",
-                        {"chat_id": chat_id, "tool": tool_call.name, "token": decision.token},
+                        {"tool": tool_call.name, "token": decision.token},
+                        chat_id=chat_id,
+                        connector=connector,
+                        decision="pending_approval",
                     )
                     return
                 if not decision.allowed:
@@ -296,14 +359,29 @@ class Worker:
                         channel, chat_id, f"Tool `{tool_call.name}` failed: {exc}", connector=connector
                     )
                     return
-                logger.debug("Tool result name=%s content_len=%s", tool_call.name, len(result.content or ""))
+
+                # Mask secrets in tool output before storing or returning to LLM
+                masked_content = result.content
+                if getattr(getattr(self.config, "security", None), "mask_secrets_in_output", True):
+                    masked_content = mask_secrets(result.content or "")
+
+                logger.debug("Tool result name=%s content_len=%s", tool_call.name, len(masked_content))
                 self.db.add_tool_call(
                     assistant_message_id,
                     tool_call.name,
                     tool_call.arguments,
-                    {"content": result.content, "data": result.data},
+                    {"content": masked_content, "data": result.data},
                 )
-                tool_results.append((tool_call, result))
+                self.db.add_audit(
+                    "tool_executed",
+                    {"tool": tool_call.name},
+                    chat_id=chat_id,
+                    connector=connector,
+                    decision="allowed",
+                )
+                # Return masked content so secrets don't leak into LLM context
+                from umabot.tools.registry import ToolResult as _TR
+                tool_results.append((tool_call, _TR(content=masked_content, data=result.data)))
 
             for tool_call, result in tool_results:
                 tool_message = {
@@ -350,6 +428,7 @@ class Worker:
             max_agent_iterations=agents_cfg.max_agent_iterations,
             skill_context=skill_context,
             skill_context_full=skill_context_full,
+            agent_context=self.agent_context,
         )
 
         return await orchestrator.run(task=task, history=history)
@@ -375,6 +454,7 @@ class Worker:
         )
         self.db.add_message(session_id, "user", run_text)
         messages = self.db.list_recent_messages(session_id, limit=20)
+        messages = [_date_system_message()] + messages
         self.skill_registry.refresh()
         self._context_state = _refresh_context_state(
             self._context_state, self.skill_registry, self.tool_registry
@@ -628,6 +708,27 @@ def _build_agent_llm_client(config, agent_model_cfg, rate_limiter=None):
     raise RuntimeError(f"Unknown LLM provider for agent: {provider}")
 
 
+def _load_agent_context(context_file: str) -> str:
+    """Read the user's AGENT.md file and return its contents.
+
+    Returns an empty string silently if the file doesn't exist — the file is
+    optional and its absence is the expected state for new installs.
+    """
+    if not context_file:
+        return ""
+    path = Path(context_file).expanduser()
+    if not path.exists():
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+        if content:
+            logger.info("Loaded agent context from %s (%d chars)", path, len(content))
+        return content
+    except OSError as exc:
+        logger.warning("Could not read agent context file %s: %s", path, exc)
+        return ""
+
+
 def _build_llm_client(config, rate_limiter=None):
     provider = config.llm.provider.lower()
     api_key = config.llm.api_key
@@ -746,6 +847,27 @@ def _line_starts(text: str):
     for i, ch in enumerate(text):
         if ch == "\n" and i + 1 < len(text):
             yield i + 1
+
+
+def _date_system_message() -> Dict[str, str]:
+    """Return a system message containing the real current date and week range.
+
+    Injected at the top of every LLM call so the model can resolve relative
+    date references (today, this week, tomorrow, next Monday, etc.) correctly
+    instead of guessing from its training-data cutoff.
+    """
+    from datetime import datetime, timedelta, timezone as _tz
+    now = datetime.now(_tz.utc)
+    week_start = now.date() - timedelta(days=now.weekday())   # Monday
+    week_end   = week_start + timedelta(days=6)               # Sunday
+    content = (
+        f"Current date/time: {now.strftime('%Y-%m-%dT%H:%M:%SZ')} (UTC)\n"
+        f"Today: {now.strftime('%A, %Y-%m-%d')}\n"
+        f"This week: {week_start.isoformat()} (Mon) to {week_end.isoformat()} (Sun)\n"
+        "When the user says 'today', 'tomorrow', 'this week', 'next Monday', etc., "
+        "resolve them using the date above and pass concrete ISO 8601 timestamps to any tools."
+    )
+    return {"role": "system", "content": content}
 
 
 def _build_skill_system_messages(
