@@ -69,7 +69,7 @@ def run_wizard(
             )
         )
         cfg = default_config()
-        selected = {"llm", "control_panel", "connectors", "integrations", "tools", "workspaces"}
+        selected = {"llm", "control_panel", "connectors", "integrations", "tools", "workspaces", "skills_dirs", "agents"}
         setup_mode = questionary.select(
             "Choose setup mode:",
             choices=[
@@ -183,6 +183,24 @@ def run_wizard(
         )
         _step_workspaces(cfg)
 
+    # ── Step 7: Skills ───────────────────────────────────────────────────
+    if "skills_dirs" in selected:
+        console.print("\n[bold]Step 7: Skills[/bold]")
+        console.print(
+            "[dim]Directories containing Agent Skills (SKILL.md folders).\n"
+            "Each directory is scanned recursively for skills at startup.[/dim]\n"
+        )
+        _step_skill_dirs(cfg)
+
+    # ── Step 8: Agents ───────────────────────────────────────────────────
+    if "agents" in selected:
+        console.print("\n[bold]Step 8: Multi-agent orchestration[/bold]")
+        console.print(
+            "[dim]When enabled, requests are routed through a dynamic orchestrator\n"
+            "that spawns specialist agents with tool access and workspace awareness.[/dim]\n"
+        )
+        _step_agents(cfg)
+
     # ── Persist ──────────────────────────────────────────────────────────
     # Generate ws_token only if one doesn't already exist
     if not cfg.runtime.ws_token:
@@ -269,6 +287,9 @@ def _print_current_status(cfg: Config) -> None:
     else:
         ws_info = "[dim]none — will use tmp[/dim]"
 
+    skill_dirs_info = f"{len(cfg.skill_dirs)} dir(s)" if cfg.skill_dirs else "[dim]none[/dim]"
+    agents_info = "[green]enabled[/green]" if cfg.agents.enabled else "[dim]disabled[/dim]"
+
     console.print(
         "\n[bold]Current configuration[/bold]\n"
         f"  AI Provider    : {provider_info}\n"
@@ -277,6 +298,8 @@ def _print_current_status(cfg: Config) -> None:
         f"  Google Workspace: {google_info}\n"
         f"  Shell tool     : {shell_info}\n"
         f"  Workspaces     : {ws_info}\n"
+        f"  Skill dirs     : {skill_dirs_info}\n"
+        f"  Agents         : {agents_info}\n"
     )
 
 
@@ -307,9 +330,15 @@ def _pick_steps(cfg: Config) -> set:
             ws_list = cfg.tools.workspaces or []
             info = f"{len(ws_list)} configured" if ws_list else "none"
             return f"Workspaces           [{info}]{tag}"
+        if step_id == "skills_dirs":
+            info = f"{len(cfg.skill_dirs)} dir(s)" if cfg.skill_dirs else "none"
+            return f"Skills               [{info}]{tag}"
+        if step_id == "agents":
+            info = "enabled" if cfg.agents.enabled else "disabled"
+            return f"Agents               [{info}]{tag}"
         return step_id
 
-    _ALL = ["llm", "control_panel", "connectors", "integrations", "tools", "workspaces"]
+    _ALL = ["llm", "control_panel", "connectors", "integrations", "tools", "workspaces", "skills_dirs", "agents"]
 
     while True:
         choices = [Choice(_label(s), value=s) for s in _ALL]
@@ -426,6 +455,112 @@ def _step_workspaces(cfg: Config) -> None:
                 cfg.tools.workspaces = [w for w in ws_list if w.name != to_remove]
                 ws_list = cfg.tools.workspaces
                 console.print(f"  [dim]Removed workspace '{to_remove}'.[/dim]")
+
+
+def _step_skill_dirs(cfg: Config) -> None:
+    """Configure directories scanned for Agent Skills."""
+    dirs = list(cfg.skill_dirs or [])
+
+    if dirs:
+        console.print("  Currently configured:")
+        for d in dirs:
+            console.print(f"    [cyan]{d}[/cyan]")
+
+    while True:
+        action = questionary.select(
+            "Skill directory action:",
+            choices=[
+                Choice("Add directory",    value="add"),
+                Choice("Remove directory", value="remove"),
+                Choice("Done",             value="done"),
+            ],
+        ).ask()
+
+        if action is None or action == "done":
+            break
+
+        if action == "add":
+            path = (questionary.text("Path to skills directory (e.g. ~/projects/skills/skills):").ask() or "").strip()
+            if not path:
+                continue
+            from pathlib import Path as _Path
+            expanded = str(_Path(path).expanduser())
+            if expanded in dirs:
+                console.print(f"  [yellow]Already configured: {expanded}[/yellow]")
+                continue
+            if not _Path(expanded).exists():
+                console.print(f"  [yellow]Warning: path does not exist yet: {expanded}[/yellow]")
+            dirs.append(expanded)
+            cfg.skill_dirs = dirs
+            console.print(f"  [green]✓ Added skill directory: {expanded}[/green]")
+
+        elif action == "remove":
+            if not dirs:
+                console.print("[yellow]No skill directories to remove.[/yellow]")
+                continue
+            choices = [Choice(d, value=d) for d in dirs]
+            choices.append(Choice("Cancel", value=""))
+            to_remove = questionary.select("Remove which directory?", choices=choices).ask()
+            if to_remove:
+                dirs = [d for d in dirs if d != to_remove]
+                cfg.skill_dirs = dirs
+                console.print(f"  [dim]Removed: {to_remove}[/dim]")
+
+
+def _step_agents(cfg: Config) -> None:
+    """Configure multi-agent orchestration."""
+    current = "[green]enabled[/green]" if cfg.agents.enabled else "[dim]disabled[/dim]"
+    cfg.agents.enabled = questionary.confirm(
+        f"Enable multi-agent orchestration? (currently {current})",
+        default=cfg.agents.enabled,
+    ).ask()
+
+    if not cfg.agents.enabled:
+        return
+
+    console.print(
+        "\n  [dim]Orchestrator and worker agents can use separate models.\n"
+        "  Leave blank to inherit the main LLM provider/model.[/dim]\n"
+    )
+
+    models_by_provider = {
+        "claude": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+        "openai": ["o3", "o4-mini", "gpt-4o", "gpt-4o-mini"],
+        "gemini": ["gemini-2.5-pro", "gemini-2.0-flash"],
+    }
+    all_models = [m for models in models_by_provider.values() for m in models]
+
+    for role, label in [("orchestrator", "Orchestrator (planner — use strongest model)"),
+                        ("worker", "Worker agents (executors — can be cheaper model)")]:
+        agent_cfg = getattr(cfg.agents, role)
+        change = questionary.confirm(
+            f"  Configure {label}? (currently: {agent_cfg.model or 'inherit main LLM'})",
+            default=False,
+        ).ask()
+        if not change:
+            continue
+        model = questionary.autocomplete(
+            f"  Model for {role} (blank = inherit):",
+            choices=all_models,
+            default=agent_cfg.model or "",
+        ).ask() or ""
+        agent_cfg.model = model.strip()
+        if agent_cfg.model:
+            for provider, models in models_by_provider.items():
+                if agent_cfg.model in models:
+                    agent_cfg.provider = provider
+                    break
+
+    max_iter = questionary.text(
+        f"  Max agent iterations per task (currently {cfg.agents.max_agent_iterations}):",
+        default=str(cfg.agents.max_agent_iterations),
+    ).ask() or str(cfg.agents.max_agent_iterations)
+    try:
+        cfg.agents.max_agent_iterations = int(max_iter)
+    except ValueError:
+        pass
+
+    console.print(f"  [green]✓ Agents {'enabled' if cfg.agents.enabled else 'disabled'}.[/green]")
 
 
 def _step_control_panel(cfg: Config, is_update: bool, out_tokens: dict) -> None:

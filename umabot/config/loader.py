@@ -425,6 +425,15 @@ def _strip_secrets(data: Dict[str, Any]) -> None:
                 connector["token"] = None
                 connector["api_id"] = None
                 connector["api_hash"] = None
+    # Strip Google OAuth client_secret — store via env var GOOGLE_CLIENT_SECRET
+    # or macOS Keychain instead of committing to config.yaml
+    for google_block in ("google",):
+        if google_block in data and isinstance(data[google_block], dict):
+            data[google_block]["client_secret"] = None
+    if "integrations" in data and isinstance(data["integrations"], dict):
+        google = data["integrations"].get("google")
+        if isinstance(google, dict):
+            google["client_secret"] = None
 
 
 def _store_secrets(api_key: str, telegram_token: str, discord_token: str) -> None:
