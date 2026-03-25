@@ -347,15 +347,27 @@ def _list_element_type(hint: Any) -> Any:
 
 
 def _dataclass_from_dict(cls: Any, data: Dict[str, Any]) -> Any:
-    """Instantiate a dataclass from a dict, using field defaults for missing keys."""
+    """Instantiate a dataclass from a dict, using field defaults for missing keys.
+
+    Recursively handles nested dataclass fields (e.g. WorkspaceConfig.acl: WorkspaceACL).
+    """
     import dataclasses
+    hints = typing.get_type_hints(cls)
     field_defaults: Dict[str, Any] = {}
     for f in dataclasses.fields(cls):
         if f.default is not dataclasses.MISSING:
             field_defaults[f.name] = f.default
         elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
             field_defaults[f.name] = f.default_factory()
-    kwargs = {**field_defaults, **{k: v for k, v in data.items() if k in field_defaults or any(f.name == k for f in dataclasses.fields(cls))}}
+    kwargs: Dict[str, Any] = dict(field_defaults)
+    for k, v in data.items():
+        if not any(f.name == k for f in dataclasses.fields(cls)):
+            continue
+        field_type = hints.get(k)
+        if field_type and is_dataclass(field_type) and isinstance(v, dict):
+            kwargs[k] = _dataclass_from_dict(field_type, v)
+        else:
+            kwargs[k] = v
     return cls(**kwargs)
 
 

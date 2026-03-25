@@ -64,6 +64,12 @@ Available tools for you to call:
 
 Available tools you can grant to agents (tool_names list):
 {tool_catalog}
+
+Available workspaces (pass the name via spawn_agent workspace= so the agent operates in the right directory):
+{workspace_catalog}
+
+Available skills (agents can load full instructions via skill.get_instructions):
+{skills_catalog}
 {skill_section}{agent_context_section}"""
 
 
@@ -97,6 +103,8 @@ class DynamicOrchestrator:
         skill_context: str = "",
         skill_context_full: str = "",
         agent_context: str = "",
+        skill_registry=None,
+        workspaces: Optional[List] = None,
     ) -> None:
         self.orchestrator_llm = orchestrator_llm
         self.agent_llm = agent_llm
@@ -111,6 +119,8 @@ class DynamicOrchestrator:
         self.skill_context_full = skill_context_full
         # User-defined standing context from AGENT.md
         self.agent_context = agent_context
+        self.skill_registry = skill_registry
+        self.workspaces: List = workspaces or []
 
     async def run(self, task: str, history: Optional[List[Dict[str, Any]]] = None) -> str:
         """Run the full orchestration for ``task`` and return the final reply.
@@ -136,6 +146,10 @@ class DynamicOrchestrator:
             if self.agent_context.strip() else ""
         )
 
+        from umabot.tools.workspace import workspace_summary
+        workspace_catalog = workspace_summary(self.workspaces)
+        skills_catalog = self._build_skills_catalog()
+
         system_prompt = _ORCHESTRATOR_SYSTEM.format(
             current_datetime=now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             current_date=now_utc.strftime("%Y-%m-%d"),
@@ -143,6 +157,8 @@ class DynamicOrchestrator:
             week_start=week_start.isoformat(),
             week_end=week_end.isoformat(),
             tool_catalog=tool_catalog,
+            workspace_catalog=workspace_catalog,
+            skills_catalog=skills_catalog,
             skill_section=skill_note,
             agent_context_section=agent_context_section,
         )
@@ -210,11 +226,24 @@ class DynamicOrchestrator:
         return f"Unknown orchestrator tool: {name}"
 
     async def _spawn_agent(self, args: Dict[str, Any]) -> str:
+        from umabot.tools.workspace import resolve_workspace, set_active_workspace
+
         role = str(args.get("role", "Agent"))
         objective = str(args.get("objective", ""))
         system_prompt = str(args.get("system_prompt", f"You are a {role}. Complete the objective precisely."))
         tool_names = args.get("tools", [])
         context = str(args.get("context", ""))
+
+        # Set the workspace for this agent's execution context
+        workspace_name = str(args.get("workspace", "")).strip()
+        ws = resolve_workspace(workspace_name, self.workspaces)
+        set_active_workspace(ws)
+        workspace_note = (
+            f"\n\nActive workspace: {ws.name} ({ws.path})\n"
+            f"Relative file paths are resolved against this directory.\n"
+            f"shell.run cwd defaults to this path."
+        )
+        system_prompt = system_prompt + workspace_note
         # Append key skill instructions to the agent's system_prompt.
         # We prepend a concrete quick-start template so the agent can write the
         # full script in a SINGLE shell.run call instead of exploring incrementally.
@@ -286,6 +315,17 @@ class DynamicOrchestrator:
         # No callback configured — auto-deny for safety
         return "denied — approval callback not configured"
 
+    def _build_skills_catalog(self) -> str:
+        if not self.skill_registry:
+            return "  (no skills loaded)"
+        skills = self.skill_registry.list()
+        if not skills:
+            return "  (no skills loaded)"
+        lines = []
+        for skill in sorted(skills, key=lambda s: s.metadata.name):
+            lines.append(f"  - {skill.metadata.name}: {skill.metadata.description[:120]}")
+        return "\n".join(lines)
+
     def _build_tool_catalog(self) -> str:
         lines = []
         for name in sorted(self.available_tool_names):
@@ -327,6 +367,14 @@ class DynamicOrchestrator:
                         "context": {
                             "type": "string",
                             "description": "Optional extra context, data, or partial results to pass to the agent.",
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Name of the workspace this agent should operate in. "
+                                "Must match a name from the available workspaces list. "
+                                "Leave empty to use the default workspace."
+                            ),
                         },
                     },
                     "required": ["role", "objective", "system_prompt", "tools"],

@@ -114,15 +114,20 @@ class TelegramBotConnector(BaseConnector):
 
     async def _poll_loop(self, ws) -> None:
         """Poll Telegram Bot API for updates."""
+        import socket
         poll_attempt = 0
         while not self._stop.is_set():
-            params = {"timeout": 20}
+            params = {"timeout": 30}
             if self._offset is not None:
                 params["offset"] = self._offset
 
             try:
                 data = await asyncio.to_thread(self._get, "getUpdates", params)
                 poll_attempt = 0  # reset on success
+            except (TimeoutError, socket.timeout) as exc:
+                # Read timeout is normal during idle periods — just retry without backoff
+                logger.debug("Telegram long-poll timed out (%s), retrying immediately", exc)
+                continue
             except Exception as exc:
                 delay = backoff_delay(poll_attempt)
                 poll_attempt += 1
@@ -326,7 +331,8 @@ class TelegramBotConnector(BaseConnector):
     def _get(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         url = f"https://api.telegram.org/bot{self.token}/{method}?{urlencode(params)}"
         req = Request(url, headers={"User-Agent": "umabot/0.1"})
-        with urlopen(req, timeout=30) as resp:
+        # timeout=40 gives the 30s long-poll 10s buffer before the socket times out
+        with urlopen(req, timeout=40) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def _post(self, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:

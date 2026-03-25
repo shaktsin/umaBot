@@ -20,6 +20,8 @@ from umabot.config.schema import (
     ConnectorConfig,
     ControlPanelConfig,
     LLMConfig,
+    WorkspaceACL,
+    WorkspaceConfig,
     default_config,
 )
 from umabot.llm.openai_client import _is_reasoning_model
@@ -67,7 +69,7 @@ def run_wizard(
             )
         )
         cfg = default_config()
-        selected = {"llm", "control_panel", "connectors", "integrations", "tools"}
+        selected = {"llm", "control_panel", "connectors", "integrations", "tools", "workspaces"}
         setup_mode = questionary.select(
             "Choose setup mode:",
             choices=[
@@ -172,6 +174,15 @@ def run_wizard(
             ).ask()
             cfg.policy.confirmation_strictness = strictness
 
+    # ── Step 6: Workspaces ───────────────────────────────────────────────
+    if "workspaces" in selected:
+        console.print("\n[bold]Step 6: Workspaces[/bold]")
+        console.print(
+            "[dim]Named directories umabot can read/write. Each has its own ACL.\n"
+            "Agents pick the right workspace per task. No workspace = uses a temp dir.[/dim]\n"
+        )
+        _step_workspaces(cfg)
+
     # ── Persist ──────────────────────────────────────────────────────────
     # Generate ws_token only if one doesn't already exist
     if not cfg.runtime.ws_token:
@@ -250,6 +261,13 @@ def _print_current_status(cfg: Config) -> None:
         else "[dim]not configured[/dim]"
     )
     shell_info = "[green]enabled[/green]" if cfg.tools.shell_enabled else "[dim]disabled[/dim]"
+    ws_list = cfg.tools.workspaces or []
+    if ws_list:
+        ws_info = ", ".join(
+            f"{w.name}{'*' if w.default else ''}" for w in ws_list
+        ) + f"  ({len(ws_list)} total)"
+    else:
+        ws_info = "[dim]none — will use tmp[/dim]"
 
     console.print(
         "\n[bold]Current configuration[/bold]\n"
@@ -258,6 +276,7 @@ def _print_current_status(cfg: Config) -> None:
         f"  Connectors     : {connector_info}\n"
         f"  Google Workspace: {google_info}\n"
         f"  Shell tool     : {shell_info}\n"
+        f"  Workspaces     : {ws_info}\n"
     )
 
 
@@ -284,9 +303,13 @@ def _pick_steps(cfg: Config) -> set:
         if step_id == "tools":
             info = "shell on" if cfg.tools.shell_enabled else "shell off"
             return f"Tools & Security     [{info}]{tag}"
+        if step_id == "workspaces":
+            ws_list = cfg.tools.workspaces or []
+            info = f"{len(ws_list)} configured" if ws_list else "none"
+            return f"Workspaces           [{info}]{tag}"
         return step_id
 
-    _ALL = ["llm", "control_panel", "connectors", "integrations", "tools"]
+    _ALL = ["llm", "control_panel", "connectors", "integrations", "tools", "workspaces"]
 
     while True:
         choices = [Choice(_label(s), value=s) for s in _ALL]
@@ -312,6 +335,97 @@ def _pick_steps(cfg: Config) -> set:
             console.print(f"[green]  → {pick} queued.[/green]")
 
     return selected
+
+
+def _workspace_acl_summary(acl) -> str:
+    parts = []
+    if acl.read:
+        parts.append("r")
+    if acl.write or acl.create_files:
+        parts.append("w")
+    if acl.delete_files:
+        parts.append("del")
+    if acl.shell:
+        parts.append("shell")
+    return ",".join(parts) if parts else "no-access"
+
+
+def _step_workspaces(cfg: Config) -> None:
+    """Configure named workspaces with per-directory ACL."""
+    ws_list = cfg.tools.workspaces or []
+
+    if ws_list:
+        console.print("  Currently configured:")
+        for ws in ws_list:
+            acl_str = _workspace_acl_summary(ws.acl)
+            default_tag = "  [cyan][default][/cyan]" if ws.default else ""
+            console.print(f"    [bold]{ws.name}[/bold]  {ws.path}  [{acl_str}]{default_tag}")
+    else:
+        console.print("  [dim]No workspaces — agents will use a temp directory.[/dim]")
+
+    while True:
+        action = questionary.select(
+            "Workspace action:",
+            choices=[
+                Choice("Add workspace",    value="add"),
+                Choice("Remove workspace", value="remove"),
+                Choice("Done",             value="done"),
+            ],
+        ).ask()
+
+        if action is None or action == "done":
+            break
+
+        if action == "add":
+            name = (questionary.text("Workspace name (e.g. projects, downloads):").ask() or "").strip()
+            if not name:
+                continue
+            name = name.lower().replace(" ", "-")
+            path = (questionary.text(f"Absolute or ~ path for '{name}':").ask() or "").strip()
+            if not path:
+                continue
+
+            can_read    = questionary.confirm("Allow reading files?",           default=True).ask()
+            can_write   = questionary.confirm("Allow writing/modifying files?", default=True).ask()
+            can_create  = questionary.confirm("Allow creating new files?",      default=can_write).ask() if can_write else False
+            can_delete  = questionary.confirm("Allow deleting files?",          default=False).ask() if can_write else False
+            can_shell   = questionary.confirm("Allow shell commands (cwd)?",    default=True).ask()
+            is_default  = questionary.confirm(
+                "Set as default workspace?",
+                default=not ws_list,
+            ).ask()
+
+            if is_default:
+                for existing in ws_list:
+                    existing.default = False
+
+            ws = WorkspaceConfig(
+                name=name,
+                path=path,
+                acl=WorkspaceACL(
+                    read=can_read,
+                    write=can_write,
+                    create_files=can_create,
+                    delete_files=can_delete,
+                    shell=can_shell,
+                ),
+                default=is_default,
+            )
+            ws_list.append(ws)
+            cfg.tools.workspaces = ws_list
+            console.print(f"  [green]✓ Workspace '{name}' added.[/green]")
+
+        elif action == "remove":
+            if not ws_list:
+                console.print("[yellow]No workspaces to remove.[/yellow]")
+                continue
+            choices = [Choice(f"{ws.name}  ({ws.path})", value=ws.name) for ws in ws_list]
+            choices.append(Choice("Cancel", value=""))
+            to_remove = questionary.select("Remove which workspace?", choices=choices).ask()
+            if to_remove:
+                cfg.tools.workspaces = [w for w in ws_list if w.name != to_remove]
+                ws_list = cfg.tools.workspaces
+                console.print(f"  [dim]Removed workspace '{to_remove}'.[/dim]")
 
 
 def _step_control_panel(cfg: Config, is_update: bool, out_tokens: dict) -> None:
