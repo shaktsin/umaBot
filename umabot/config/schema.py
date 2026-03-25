@@ -146,8 +146,57 @@ class SecurityConfig:
 
 
 @dataclass
+class WorkspaceACL:
+    """Fine-grained access control for a workspace directory.
+
+    Each flag independently gates a class of operation.  For example you can
+    allow reads (browsing build output) while denying deletes.
+    """
+
+    read: bool = True           # file.read / file.list
+    write: bool = True          # file.write (modify existing)
+    create_files: bool = True   # file.write (create new)
+    delete_files: bool = False  # file.delete
+    shell: bool = True          # shell.run may use this dir as cwd
+
+
+@dataclass
+class WorkspaceConfig:
+    """A named, sandboxed directory umabot may operate in.
+
+    Example config.yaml::
+
+        tools:
+          workspaces:
+            - name: projects
+              path: ~/projects
+              default: true
+              acl:
+                read: true
+                write: true
+                create_files: true
+                delete_files: false
+                shell: true
+            - name: downloads
+              path: ~/Downloads
+              acl:
+                read: true
+                write: false
+                create_files: false
+                delete_files: false
+                shell: false
+    """
+
+    name: str = ""
+    path: str = ""
+    acl: WorkspaceACL = field(default_factory=WorkspaceACL)
+    default: bool = False   # used when user doesn't specify a workspace
+
+
+@dataclass
 class ToolsConfig:
     shell_enabled: bool = False
+    workspaces: List[WorkspaceConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -357,6 +406,9 @@ class Config:
             self.skills.defaults.python_bin = sys.executable
         for override in self.skills._per_skill.values():
             _resolve_skill_runtime_override(override)
+        for ws in self.tools.workspaces:
+            if ws.path:
+                ws.path = _expand_path(ws.path)
 
 
 def _expand_path(path: str) -> str:

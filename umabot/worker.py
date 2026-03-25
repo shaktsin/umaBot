@@ -19,6 +19,11 @@ from umabot.tasks.parser import parse_control_task_request
 from umabot.tasks.schedule import compute_initial_next_run_at, compute_next_run_at
 from umabot.tools import ToolRegistry, UnifiedToolRegistry
 from umabot.tools.builtin import set_active_skill_env
+from umabot.tools.workspace import (
+    detect_workspace_from_text,
+    resolve_workspace,
+    set_active_workspace,
+)
 
 
 logger = logging.getLogger("umabot.worker")
@@ -112,8 +117,9 @@ class Worker:
             if not job:
                 await asyncio.sleep(0.2)
                 continue
-            # Clear any leftover skill env from the previous job in this loop.
+            # Clear any leftover skill env / workspace from the previous job.
             set_active_skill_env(None)
+            set_active_workspace(None)
             try:
                 await self._process_job(job)
                 await self.queue.complete(job["id"])
@@ -172,6 +178,14 @@ class Worker:
             matched_skill = self.skill_registry.match_trigger(text)
             if matched_skill and matched_skill.resolved_runtime:
                 set_active_skill_env(matched_skill.resolved_runtime.env)
+
+            # Resolve active workspace: detect from user message, else default
+            configured_workspaces = getattr(
+                getattr(self.config, "tools", None), "workspaces", []
+            ) or []
+            detected_ws = detect_workspace_from_text(text, configured_workspaces)
+            active_ws = detected_ws or resolve_workspace("", configured_workspaces)
+            set_active_workspace(active_ws)
 
             allowed_tools = self._allowed_tools()
 
@@ -413,6 +427,9 @@ class Worker:
         skill_context_full: str = "",
     ) -> str:
         """Delegate a task to the DynamicOrchestrator and return the final reply."""
+        configured_workspaces = getattr(
+            getattr(self.config, "tools", None), "workspaces", []
+        ) or []
 
         async def send_update(message: str) -> None:
             await self.send_message(channel, chat_id, f"[update] {message}", connector=connector)
@@ -429,6 +446,8 @@ class Worker:
             skill_context=skill_context,
             skill_context_full=skill_context_full,
             agent_context=self.agent_context,
+            skill_registry=self.skill_registry,
+            workspaces=configured_workspaces,
         )
 
         return await orchestrator.run(task=task, history=history)
