@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from aiohttp import web
 
@@ -37,7 +37,14 @@ class ChannelHub:
                 if client and self._on_status:
                     self._on_status(client.connector, channel, client.mode, "disconnected")
 
-    async def send(self, channel: str, connector: str, chat_id: str, text: str) -> bool:
+    async def send(
+        self,
+        channel: str,
+        connector: str,
+        chat_id: str,
+        text: str,
+        attachments: Optional[List[dict]] = None,
+    ) -> bool:
         async with self._lock:
             bucket = self._clients.get(channel)
             if not bucket:
@@ -45,7 +52,10 @@ class ChannelHub:
             client = next((c for c in bucket.values() if c.connector == connector), None)
             if not client:
                 return False
-            await client.ws.send_json({"type": "send", "chat_id": chat_id, "text": text})
+            payload: dict = {"type": "send", "chat_id": chat_id, "text": text}
+            if attachments:
+                payload["attachments"] = attachments
+            await client.ws.send_json(payload)
             return True
 
     async def send_payload(self, channel: str, connector: str, chat_id: str, payload: dict) -> bool:

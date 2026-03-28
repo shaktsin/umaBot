@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from umabot.agents import DynamicOrchestrator
+from umabot.intent import IntentResult, detect_intent, intent_context_block
 from umabot.llm import ClaudeClient, GeminiClient, OpenAIClient
 from umabot.llm.rate_limiter import TokenBucket
+from umabot.llm.scheduler import LLMScheduler, P0, P1, P2
 from umabot.policy import PolicyEngine
 from umabot.security import SecurityPolicy, mask_secrets
 from umabot.security.ssrf import check_ssrf, SSRFError
@@ -66,7 +68,9 @@ class Worker:
         tpm = getattr(agents_cfg, "tokens_per_minute", 0) if agents_cfg else 0
         self._token_bucket: TokenBucket | None = TokenBucket(tpm) if tpm > 0 else None
 
-        self.llm_client = _build_llm_client(config, rate_limiter=self._token_bucket)
+        # Wrap each LLM client in a priority scheduler.
+        # All existing callers default to P1; future callers can pass priority=P0/P2.
+        self.llm_client = LLMScheduler(_build_llm_client(config, rate_limiter=self._token_bucket))
 
         # Security policy layer
         security_cfg = getattr(config, "security", None)
@@ -75,11 +79,15 @@ class Worker:
         # Build separate LLM clients for the orchestration system if enabled.
         # Both inherit missing fields (provider, api_key) from the top-level llm config.
         if agents_cfg and agents_cfg.enabled:
-            self.orchestrator_llm = _build_agent_llm_client(
-                config, agents_cfg.orchestrator, rate_limiter=self._token_bucket
+            self.orchestrator_llm = LLMScheduler(
+                _build_agent_llm_client(
+                    config, agents_cfg.orchestrator, rate_limiter=self._token_bucket
+                )
             )
-            self.agent_llm = _build_agent_llm_client(
-                config, agents_cfg.worker, rate_limiter=self._token_bucket
+            self.agent_llm = LLMScheduler(
+                _build_agent_llm_client(
+                    config, agents_cfg.worker, rate_limiter=self._token_bucket
+                )
             )
         else:
             self.orchestrator_llm = None
@@ -94,6 +102,12 @@ class Worker:
 
     async def start(self) -> None:
         self._stop.clear()
+        # Start LLM schedulers before spawning worker loops
+        self.llm_client.start()
+        if self.orchestrator_llm:
+            self.orchestrator_llm.start()
+        if self.agent_llm:
+            self.agent_llm.start()
         self._tasks = [
             asyncio.create_task(self._worker_loop(), name=f"worker-{i}")
             for i in range(self._concurrency)
@@ -109,6 +123,32 @@ class Worker:
             except asyncio.CancelledError:
                 pass
         self._tasks = []
+        # Stop LLM schedulers after worker loops exit
+        await self.llm_client.stop()
+        if self.orchestrator_llm:
+            await self.orchestrator_llm.stop()
+        if self.agent_llm:
+            await self.agent_llm.stop()
+
+    async def _notify(
+        self,
+        channel: str,
+        chat_id: str,
+        text: str,
+        connector: str,
+        *,
+        connector_role: str = "admin",
+        attachments: Optional[list] = None,
+    ) -> None:
+        """Send a reply to the right destination based on connector role.
+
+        listener → broadcast to ALL admin panels via send_control_message.
+        admin    → reply to the originating channel/connector only.
+        """
+        if connector_role == "listener":
+            await self.send_control_message(channel, chat_id, text)
+        else:
+            await self.send_message(channel, chat_id, text, connector=connector, attachments=attachments)
 
     async def _worker_loop(self) -> None:
         """Single worker loop — multiple of these run concurrently."""
@@ -146,6 +186,19 @@ class Worker:
         text = payload["text"]
         kind = payload.get("kind", "external")
         connector = payload.get("connector", "")
+        connector_role = payload.get("connector_role", "admin")
+        source_connector = payload.get("source_connector", connector)
+        source_chat_id = payload.get("source_chat_id", chat_id)
+
+        # Cross-connector reply routing: if a connector (e.g. gmail_imap) specifies
+        # reply_* fields, send all outbound responses there instead of back to the origin.
+        _rc = payload.get("reply_connector", "")
+        _rid = payload.get("reply_chat_id", "")
+        _rch = payload.get("reply_channel", "")
+        if _rc and _rid and _rch:
+            connector = _rc
+            chat_id = _rid
+            channel = _rch
 
         lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
@@ -163,11 +216,34 @@ class Worker:
                 if handled:
                     return
 
-            messages = self.db.list_recent_messages(session_id, limit=20)
+            # Intent detection for listener connectors (gmail, telegram_user, …).
+            # Runs a cheap P2 LLM call to classify the inbound message before the
+            # full agent loop.  Low-importance "ignore" messages are discarded here.
+            intent: Optional[IntentResult] = None
+            if connector_role == "listener":
+                intent = await detect_intent(text, self.llm_client)
+                logger.info(
+                    "Intent detected connector_role=listener importance=%s "
+                    "needs_admin=%s action=%s",
+                    intent.importance, intent.needs_admin, intent.suggested_action,
+                )
+                if intent.should_skip:
+                    logger.info(
+                        "Skipping low-importance ignore message from listener connector=%s",
+                        connector,
+                    )
+                    return
 
-            # Always prepend the current date so the LLM can resolve relative
-            # date references ("today", "this week", "tomorrow", etc.) correctly.
-            messages = [_date_system_message()] + messages
+            # Listener messages are processed as one-shot prompts — no session
+            # history is loaded.  Raw emails / channel messages are never stored
+            # in the DB, so the admin session stays lean.  The LLM gets:
+            #   [intent_context_block][date][current text]
+            # Admin messages load the normal 20-message window.
+            if connector_role == "listener":
+                messages = [_date_system_message(), {"role": "user", "content": text}]
+            else:
+                messages = self.db.list_recent_messages(session_id, limit=20)
+                messages = [_date_system_message()] + messages
 
             # Build system messages: skill catalog + active skill instructions.
             # Also set the active skill's resolved env so shell.run and run_script
@@ -175,6 +251,21 @@ class Worker:
             system_messages = _build_skill_system_messages(self.skill_registry, user_text=text)
             if system_messages:
                 messages = system_messages + messages
+
+            # Prepend intent context so the agent knows what action is expected
+            # without re-reading the full message body.  Source connector/chat_id
+            # are included so the LLM can route a reply to the right tool.
+            if intent is not None:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": intent_context_block(
+                            intent,
+                            source_connector=source_connector,
+                            source_chat_id=source_chat_id,
+                        ),
+                    }
+                ] + messages
             matched_skill = self.skill_registry.match_trigger(text)
             if matched_skill and matched_skill.resolved_runtime:
                 set_active_skill_env(matched_skill.resolved_runtime.env)
@@ -231,14 +322,15 @@ class Worker:
                         agents_cfg=agents_cfg,
                         skill_context=skill_context,
                         skill_context_full=skill_context_full,
+                        connector_role=connector_role,
                     )
                 except Exception as exc:
                     logger.exception("Orchestrator failed kind=%s error=%s", kind, exc)
-                    await self.send_message(channel, chat_id, f"Orchestrator failed: {exc}", connector=connector)
+                    await self._notify(channel, chat_id, f"Orchestrator failed: {exc}", connector, connector_role=connector_role)
                     return
                 if final_reply:
                     self.db.add_message(session_id, "assistant", final_reply)
-                    await self.send_message(channel, chat_id, final_reply, connector=connector)
+                    await self._notify(channel, chat_id, final_reply, connector, connector_role=connector_role)
                 return
 
             tools_spec = _build_tool_specs(self.tool_registry, allowed_tools)
@@ -255,7 +347,7 @@ class Worker:
                 response = await self.llm_client.generate(messages, tools=tools_spec)
             except Exception as exc:
                 logger.exception("LLM request failed kind=%s error=%s", kind, exc)
-                await self.send_message(channel, chat_id, "LLM request failed. Check logs.")
+                await self._notify(channel, chat_id, "LLM request failed. Check logs.", connector, connector_role=connector_role)
                 return
             logger.debug(
                 "LLM response content_len=%s tool_calls=%s",
@@ -269,7 +361,7 @@ class Worker:
 
             if not response.tool_calls:
                 if response.content:
-                    await self.send_message(channel, chat_id, response.content, connector=connector)
+                    await self._notify(channel, chat_id, response.content, connector, connector_role=connector_role)
                 return
 
             tool_results = []
@@ -293,11 +385,7 @@ class Worker:
                             connector=connector,
                             decision="denied",
                         )
-                        await self.send_message(
-                            channel, chat_id,
-                            f"Access denied: {sec.reason}",
-                            connector=connector,
-                        )
+                        await self._notify(channel, chat_id, f"Access denied: {sec.reason}", connector, connector_role=connector_role)
                         return
 
                 # SSRF protection: check url argument for tools that make HTTP requests
@@ -315,11 +403,7 @@ class Worker:
                                 connector=connector,
                                 decision="blocked",
                             )
-                            await self.send_message(
-                                channel, chat_id,
-                                f"Request blocked for security reasons: {ssrf_exc}",
-                                connector=connector,
-                            )
+                            await self._notify(channel, chat_id, f"Request blocked for security reasons: {ssrf_exc}", connector, connector_role=connector_role)
                             return
 
                 decision = self.policy.evaluate(
@@ -359,19 +443,17 @@ class Worker:
                     return
                 if not decision.allowed:
                     logger.info("Tool denied name=%s reason=%s", tool_call.name, decision.reason)
-                    await self.send_message(channel, chat_id, f"Tool denied: {decision.reason}", connector=connector)
+                    await self._notify(channel, chat_id, f"Tool denied: {decision.reason}", connector, connector_role=connector_role)
                     return
                 tool = self.tool_registry.get(tool_call.name)
                 if not tool:
-                    await self.send_message(channel, chat_id, f"Tool not found: {tool_call.name}", connector=connector)
+                    await self._notify(channel, chat_id, f"Tool not found: {tool_call.name}", connector, connector_role=connector_role)
                     return
                 try:
                     result = await tool.handler(tool_call.arguments)
                 except Exception as exc:
                     logger.exception("Tool execution failed name=%s", tool_call.name)
-                    await self.send_message(
-                        channel, chat_id, f"Tool `{tool_call.name}` failed: {exc}", connector=connector
-                    )
+                    await self._notify(channel, chat_id, f"Tool `{tool_call.name}` failed: {exc}", connector, connector_role=connector_role)
                     return
 
                 # Mask secrets in tool output before storing or returning to LLM
@@ -395,7 +477,12 @@ class Worker:
                 )
                 # Return masked content so secrets don't leak into LLM context
                 from umabot.tools.registry import ToolResult as _TR
-                tool_results.append((tool_call, _TR(content=masked_content, data=result.data)))
+                tool_results.append((tool_call, _TR(content=masked_content, data=result.data, attachments=result.attachments)))
+
+            # Collect all attachments produced by tool calls in this round
+            pending_attachments = []
+            for _, result in tool_results:
+                pending_attachments.extend(result.attachments)
 
             for tool_call, result in tool_results:
                 tool_message = {
@@ -410,7 +497,8 @@ class Worker:
             follow_up = await self.llm_client.generate(messages, tools=None)
             if follow_up.content:
                 self.db.add_message(session_id, "assistant", follow_up.content)
-                await self.send_message(channel, chat_id, follow_up.content, connector=connector)
+                serialized = [a.to_dict() for a in pending_attachments] if pending_attachments else None
+                await self._notify(channel, chat_id, follow_up.content, connector, connector_role=connector_role, attachments=serialized)
 
     async def _run_with_orchestrator(
         self,
@@ -425,6 +513,7 @@ class Worker:
         agents_cfg,
         skill_context: str = "",
         skill_context_full: str = "",
+        connector_role: str = "admin",
     ) -> str:
         """Delegate a task to the DynamicOrchestrator and return the final reply."""
         configured_workspaces = getattr(
@@ -432,7 +521,7 @@ class Worker:
         ) or []
 
         async def send_update(message: str) -> None:
-            await self.send_message(channel, chat_id, f"[update] {message}", connector=connector)
+            await self._notify(channel, chat_id, f"[update] {message}", connector, connector_role=connector_role)
 
         orchestrator = DynamicOrchestrator(
             orchestrator_llm=self.orchestrator_llm,

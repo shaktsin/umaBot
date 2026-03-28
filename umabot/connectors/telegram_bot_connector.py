@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -208,6 +210,8 @@ class TelegramBotConnector(BaseConnector):
                 chat_id = data.get("chat_id", "")
                 if msg_type == "send":
                     await self._send_message(chat_id, data.get("text", ""))
+                    for attachment in data.get("attachments") or []:
+                        await self._send_attachment(chat_id, attachment)
                 elif msg_type == "confirm_request":
                     await self._send_confirmation_request(
                         chat_id,
@@ -279,6 +283,38 @@ class TelegramBotConnector(BaseConnector):
         cb.record_failure()
         logger.error("Gave up sending to chat_id=%s after %d attempts", chat_id, _SEND_MAX_RETRIES)
 
+    async def _send_attachment(self, chat_id: str, attachment: dict) -> None:
+        """Send a binary attachment (image, PDF, document) via Telegram Bot API."""
+        if not chat_id:
+            return
+        cb = self._circuit_breakers.get(chat_id)
+        if cb.is_open():
+            logger.warning("Circuit open for chat_id=%s — dropping attachment", chat_id)
+            return
+
+        filename = attachment.get("filename", "file")
+        mime_type = attachment.get("mime_type", "application/octet-stream")
+        raw = base64.b64decode(attachment.get("data", ""))
+
+        # Choose API method based on MIME type
+        if mime_type.startswith("image/"):
+            method = "sendPhoto"
+            field_name = "photo"
+        else:
+            method = "sendDocument"
+            field_name = "document"
+
+        await self._rate_limiter.acquire(chat_id)
+        try:
+            await asyncio.to_thread(
+                self._post_multipart, method, chat_id, field_name, filename, mime_type, raw
+            )
+            cb.record_success()
+            logger.debug("Sent attachment chat_id=%s filename=%s", chat_id, filename)
+        except Exception as exc:
+            cb.record_failure()
+            logger.error("Failed to send attachment chat_id=%s filename=%s: %s", chat_id, filename, exc)
+
     async def _send_confirmation_request(
         self, chat_id: str, tool_name: str, args_preview: str, token: str
     ) -> None:
@@ -340,6 +376,51 @@ class TelegramBotConnector(BaseConnector):
         data = json.dumps(payload).encode("utf-8")
         req = Request(url, data=data, headers={"Content-Type": "application/json"})
         with urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _post_multipart(
+        self,
+        method: str,
+        chat_id: str,
+        field_name: str,
+        filename: str,
+        mime_type: str,
+        file_data: bytes,
+    ) -> Dict[str, Any]:
+        """Send a file via multipart/form-data to the Telegram Bot API."""
+        import email.generator
+        import email.mime.multipart
+        import email.mime.application
+        import email.mime.base
+
+        boundary = "----------boundary"
+        parts = []
+        # chat_id field
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+            f"{chat_id}\r\n"
+        )
+        # file field
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n"
+        )
+
+        body = (
+            "".join(parts).encode("utf-8")
+            + file_data
+            + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        )
+
+        url = f"https://api.telegram.org/bot{self.token}/{method}"
+        req = Request(
+            url,
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urlopen(req, timeout=60) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     async def health_check(self) -> ConnectorStatus:
