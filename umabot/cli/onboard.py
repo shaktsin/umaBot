@@ -229,11 +229,10 @@ def run_wizard(
         Panel.fit(
             f"[bold green]✓ Configuration saved to {config_file}[/bold green]\n\n"
             "Next steps:\n"
-            "  • Run [cyan]umabot doctor[/cyan] to verify setup\n"
-            "  • Run [cyan]umabot start[/cyan] to start daemon"
+            "  • Run [cyan]make doctor[/cyan] to verify setup\n"
+            "  • Run [cyan]make run[/cyan] to start in foreground, or [cyan]make start[/cyan] for daemon"
             f"{panel_hint}\n"
-            f"  • Edit [cyan]{agent_md_path}[/cyan] to give the bot context about you\n"
-            "  • Run [cyan]umabot connections[/cyan] to check status",
+            f"  • Edit [cyan]{agent_md_path}[/cyan] to give the bot context about you",
             border_style="green",
         )
     )

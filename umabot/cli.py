@@ -283,7 +283,7 @@ def _handle_skills(args) -> None:
         success, message = installer.install(source, custom_name)
         if success:
             print(f"✓ {message}")
-            print(f"\nReload the bot to activate: umabot reload")
+            print(f"\nReload the bot to activate: make reload")
         else:
             print(f"✗ Installation failed: {message}")
             sys.exit(1)
@@ -294,7 +294,7 @@ def _handle_skills(args) -> None:
         success, message = installer.uninstall(args.name)
         if success:
             print(f"✓ {message}")
-            print(f"\nReload the bot: umabot reload")
+            print(f"\nReload the bot: make reload")
         else:
             print(f"✗ {message}")
             sys.exit(1)
