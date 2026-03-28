@@ -56,6 +56,16 @@ connectors:
   #   phone: "+1234567890"
   #   allow_login: false
 
+  # Gmail IMAP connector — proactive email notifications via IMAP IDLE (no GCP required).
+  # One-time setup:
+  #   1. Enable IMAP in Gmail settings → Forwarding and POP/IMAP → Enable IMAP
+  #   2. Authorise Google in UmaBot (run make init → Integrations → Google Workspace)
+  # - name: gmail_imap
+  #   type: gmail_imap
+  #   mailbox: INBOX              # IMAP mailbox to watch (default: INBOX)
+  #   # Notifications auto-route to the local control panel (web-panel) or
+  #   # your configured Telegram/control channel — no reply_* fields needed.
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------

@@ -125,9 +125,12 @@ def store_secrets(
     api_key: str = "",
     telegram_token: str = "",
     discord_token: str = "",
+    google_client_secret: str = "",
 ) -> None:
     """Persist secrets to macOS Keychain or ~/.umabot/.env fallback."""
     _store_secrets(api_key, telegram_token, discord_token)
+    if google_client_secret:
+        _store_keychain_secret("UMABOT_GOOGLE_CLIENT_SECRET", google_client_secret)
 
 
 def run_wizard(config_path: Optional[str] = None) -> str:
@@ -498,6 +501,11 @@ def _load_keychain_secrets(cfg: Config) -> None:
         cfg.discord.token = _read_keychain_secret("UMABOT_DISCORD_TOKEN")
         if debug:
             logger.info("Keychain UMABOT_DISCORD_TOKEN loaded")
+    google = getattr(getattr(cfg, "integrations", None), "google", None)
+    if google and not google.client_secret:
+        google.client_secret = _read_keychain_secret("UMABOT_GOOGLE_CLIENT_SECRET")
+        if debug and google.client_secret:
+            logger.info("Keychain UMABOT_GOOGLE_CLIENT_SECRET loaded")
 
 
 def _read_keychain_secret(account: str) -> Optional[str]:

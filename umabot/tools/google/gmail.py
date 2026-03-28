@@ -27,7 +27,6 @@ def _fmt_headers(headers: list) -> dict:
 async def gmail_list(args: Dict[str, Any], *, client_id, client_secret, db) -> str:
     """List recent emails."""
     from .auth import get_credentials
-    from umabot.tools.registry import ToolResult
 
     creds = get_credentials(client_id, client_secret, db)
     if not creds:
@@ -120,6 +119,7 @@ async def gmail_search(args: Dict[str, Any], *, client_id, client_secret, db) ->
     args = dict(args)
     args["query"] = args.pop("query", "in:inbox")
     return await gmail_list(args, client_id=client_id, client_secret=client_secret, db=db)
+
 
 
 def _extract_body(payload: dict, depth: int = 0) -> str:

@@ -47,6 +47,14 @@ def _telegram_user_cmd(connector: str, config_path: str, log_level: Optional[str
     return cmd
 
 
+def _gmail_watch_cmd(connector: str, config_path: str, log_level: Optional[str]) -> List[str]:
+    """Build command for Gmail watch connector."""
+    cmd = [_python_cmd(), "-m", "umabot.connectors.gmail_connector", "--connector", connector, "--config", config_path]
+    if log_level:
+        cmd.extend(["--log-level", log_level])
+    return cmd
+
+
 def _build_worker_cmds(cfg, config_path: str, log_level: Optional[str]) -> List[tuple[List[str], bool]]:
     """
     Build commands for all connector workers.
@@ -82,7 +90,10 @@ def _build_worker_cmds(cfg, config_path: str, log_level: Optional[str]) -> List[
             cmd = _telegram_bot_cmd(conn_name, config_path, log_level)
             cmds.append((cmd, False))
 
-        # Add more connector types here as they're implemented
+        elif conn_type == "gmail_imap":
+            cmd = _gmail_watch_cmd(conn_name, config_path, log_level)
+            cmds.append((cmd, False))
+
         # elif conn_type == "discord":
         #     cmd = _discord_cmd(conn_name, config_path, log_level)
         #     cmds.append((cmd, False))

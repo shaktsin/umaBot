@@ -10,6 +10,7 @@ Tell it to manage your calendar, run scripts, browse the web, or handle anything
 
 - **Answers and acts** — backed by Claude, OpenAI, or Gemini; can call tools, run shell commands, and use external APIs
 - **Talks to you where you are** — Telegram bot, Telegram user account, Discord, or local web panel
+- **Watches your inbox** — Gmail IMAP connector reads new emails, summarises them, and drafts replies for you to approve
 - **Asks before acting** — dangerous operations (shell commands, file deletes) require your explicit approval via your control panel
 - **Skills** — extend the bot with packaged capabilities (web browsing, GitHub, finance, etc.) without changing core code
 - **Scheduled tasks** — ask it to do things on a schedule: "summarize my inbox every morning at 9am"
@@ -31,10 +32,11 @@ make run         # start in foreground (Ctrl+C to stop)
 
 `make init` walks you through:
 1. Choosing your AI provider and model
-2. Setting up a Telegram bot as your control panel
-3. Adding message connectors (bots or your personal Telegram account)
-4. Configuring workspaces (sandboxed directories the agent can work in)
-5. Installing skills
+2. Setting up your control panel (web or Telegram bot)
+3. Connecting integrations (Google Workspace for Gmail/Calendar)
+4. Adding message connectors (Telegram account, Discord, or Gmail IMAP)
+5. Configuring workspaces (sandboxed directories the agent can work in)
+6. Installing skills
 
 After setup, run `make doctor` to verify everything is wired up correctly.
 
@@ -58,21 +60,39 @@ Run `make help` for the full command list.
 
 ## Connectors
 
-Connectors are the channels the bot listens and replies on. Configure them in `~/.umabot/config.yaml`:
+Connectors are split into two roles that determine how messages flow:
+
+| Role | Types | Behaviour |
+|------|-------|-----------|
+| **listener** | `gmail_imap`, `telegram_user`, `discord` | Inbound-only. PII-filtered. Summaries forwarded to your control panel for review. |
+| **admin** | `telegram_bot`, web panel | Bidirectional. Your private control interface. Receives all notifications and approval requests. |
+
+The role is assigned automatically from the connector `type` — you never configure it manually.
+
+### Listener connectors
 
 ```yaml
 connectors:
-  - name: my_bot
-    type: telegram_bot
-    token: null   # set via env UMABOT_CONNECTOR_MY_BOT_TOKEN
+  # Watch your Gmail inbox via IMAP IDLE (no GCP required)
+  - name: gmail_imap
+    type: gmail_imap
+    mailbox: INBOX          # defaults to INBOX
+
+  # Read all your personal Telegram chats
+  - name: my_account
+    type: telegram_user
+    api_id: null
+    api_hash: null
 ```
 
-**Supported types:**
-- `telegram_bot` — a Telegram bot (requires token from @BotFather)
-- `telegram_user` — your personal Telegram account via MTProto (reads all your chats)
-- `discord` — Discord bot (requires `pip install -e ".[discord]"`)
+When a new email or message arrives:
+1. PII (email addresses, phone numbers, SSNs) is masked before storage
+2. A lightweight LLM call classifies importance and suggests an action
+3. Low-importance noise is silently discarded — no LLM cost
+4. Everything else is summarised and sent to **all** your admin panels simultaneously
+5. If a reply is appropriate, a draft is prepared for your review before sending
 
-**Control panel** — one connector can be your private control panel. This is where approval requests are sent when the bot wants to run a risky operation:
+### Admin connectors (control panel)
 
 ```yaml
 control_panel:
@@ -80,6 +100,20 @@ control_panel:
   ui_type: telegram        # telegram | web
   connector: my_bot
   chat_id: "123456789"     # your personal Telegram ID
+```
+
+You can run multiple admin panels simultaneously (e.g. web panel at home + Telegram on mobile):
+
+```yaml
+control_panels:
+  - enabled: true
+    ui_type: web
+    web_host: 127.0.0.1
+    web_port: 8080
+  - enabled: true
+    ui_type: telegram
+    connector: my_bot
+    chat_id: "123456789"
 ```
 
 ---

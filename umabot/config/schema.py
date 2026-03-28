@@ -31,16 +31,35 @@ class ControlPanelConfig:
     web_port: int = 5000
 
 
+# Connector types that are inbound-only (listener role).
+# Everything else is treated as admin (bidirectional, trusted).
+_LISTENER_TYPES: frozenset = frozenset({"gmail_imap", "telegram_user", "discord"})
+
+
 @dataclass
 class ConnectorConfig:
     name: str
-    type: str  # telegram_bot | telegram_user | discord | whatsapp
+    type: str  # telegram_bot | telegram_user | discord | gmail_imap
+    # Telegram bot / user fields
     token: Optional[str] = None
     api_id: Optional[str] = None
     api_hash: Optional[str] = None
     session_name: Optional[str] = None
     phone: Optional[str] = None
     allow_login: bool = False
+    # Gmail IMAP connector fields
+    mailbox: str = "INBOX"           # IMAP mailbox to watch (default: INBOX)
+    reply_connector: str = ""        # connector to route LLM responses to (e.g. control_panel_bot)
+    reply_chat_id: str = ""          # chat_id to route LLM responses to (e.g. owner Telegram ID)
+    reply_channel: str = "telegram"  # channel type of the reply target
+    # Auto-assigned from type — never set manually in config.yaml.
+    # "listener" = inbound-only, PII-filtered, pinned to admin session.
+    # "admin"    = bidirectional, trusted, receives notifications.
+    role: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.role:
+            self.role = "listener" if self.type in _LISTENER_TYPES else "admin"
 
 
 @dataclass
@@ -427,3 +446,15 @@ def default_config() -> Config:
     cfg = Config()
     cfg.resolve_paths()
     return cfg
+
+
+def get_connector_role(config: "Config", connector_name: str) -> str:
+    """Return 'listener' or 'admin' for the named connector.
+
+    Falls back to 'admin' if the connector is not found in config (e.g. the
+    built-in web-panel pseudo-connector).
+    """
+    for c in config.connectors:
+        if c.name == connector_name:
+            return c.role
+    return "admin"

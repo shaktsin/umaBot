@@ -8,6 +8,8 @@
         build publish-test publish \
         info doctor
 
+INSTALL_STAMP = $(VENV)/.install-stamp
+
 # ---------------------------------------------------------------------------
 # Variables
 # ---------------------------------------------------------------------------
@@ -40,7 +42,7 @@ help: ## Show this help
 	@echo "$(GREEN)Venv:$(NC)    $(VENV)"
 	@echo ""
 	@echo "$(GREEN)Setup$(NC)"
-	@echo "  $(YELLOW)install$(NC)       Create venv and install dependencies"
+	@echo "  $(YELLOW)install$(NC)       Create venv and install all dependencies"
 	@echo "  $(YELLOW)dev$(NC)           Install with dev dependencies (pytest, black, mypy…)"
 	@echo "  $(YELLOW)upgrade$(NC)       Upgrade all installed dependencies"
 	@echo "  $(YELLOW)init$(NC)          Run interactive configuration wizard"
@@ -95,35 +97,40 @@ help: ## Show this help
 # Setup
 # ---------------------------------------------------------------------------
 
-install: ## Create venv and install dependencies
-	@echo "$(BLUE)Installing UmaBot...$(NC)"
+$(INSTALL_STAMP): pyproject.toml
 	@if [ ! -d "$(VENV)" ]; then \
 		echo "$(YELLOW)Creating virtual environment...$(NC)"; \
 		$(PYTHON) -m venv $(VENV); \
 	fi
 	@$(PIP) install --quiet --upgrade pip
-	@$(PIP) install -e .
-	@echo "$(GREEN)✓ Done. Run 'make init' to configure.$(NC)"
+	@$(PIP) install --quiet -e ".[all]"
+	@touch $(INSTALL_STAMP)
+
+install: $(INSTALL_STAMP) ## Create venv and install dependencies (skips if pyproject.toml unchanged)
+	@echo "$(GREEN)✓ UmaBot installed. Run 'make init' to configure.$(NC)"
 
 dev: ## Install with dev dependencies (pytest, black, mypy, flake8)
 	@echo "$(BLUE)Installing dev dependencies...$(NC)"
 	@if [ ! -d "$(VENV)" ]; then $(PYTHON) -m venv $(VENV); fi
 	@$(PIP) install --quiet --upgrade pip
-	@$(PIP) install -e ".[dev]"
+	@$(PIP) install --quiet -e ".[dev]"
+	@touch $(INSTALL_STAMP)
 	@echo "$(GREEN)✓ Dev install complete.$(NC)"
 
 upgrade: ## Upgrade all installed dependencies
 	@echo "$(YELLOW)Upgrading dependencies...$(NC)"
 	@$(PIP) install --quiet --upgrade pip
-	@$(PIP) install --upgrade -e .
+	@$(PIP) install --quiet --upgrade -e .
+	@touch $(INSTALL_STAMP)
 	@echo "$(GREEN)✓ Upgraded.$(NC)"
 
-init: install ## Run interactive configuration wizard
+
+init: $(INSTALL_STAMP) ## Run interactive configuration wizard
 	@echo "$(BLUE)Running configuration wizard...$(NC)"
 	@mkdir -p $(CONFIG_DIR)
 	@$(UMABOT) onboard --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
 
-doctor: install ## Check config, connectors, and skill health
+doctor: $(INSTALL_STAMP) ## Check config, connectors, and skill health
 	@echo "$(BLUE)Running diagnostics...$(NC)"
 	@$(UMABOT) doctor --config $(CONFIG_FILE) --log-level $(LOG_LEVEL) || true
 
@@ -131,12 +138,13 @@ doctor: install ## Check config, connectors, and skill health
 # Run
 # ---------------------------------------------------------------------------
 
-run: install ## Start in foreground; auto-starts web panel if configured (Ctrl+C to stop)
+run: $(INSTALL_STAMP) ## Start in foreground; auto-starts web panel if configured (Ctrl+C to stop)
 	@echo "$(BLUE)Starting UmaBot...$(NC)"
 	@echo "$(YELLOW)Ctrl+C to stop$(NC)"
 	@( \
 		PANEL_PID=""; \
 		if grep -q "ui_type: web" $(CONFIG_FILE) 2>/dev/null && grep -q "enabled: true" $(CONFIG_FILE) 2>/dev/null; then \
+			$(PIP) install --quiet -e ".[panel]"; \
 			PORT=$$(grep 'web_port' $(CONFIG_FILE) 2>/dev/null | awk '{print $$2}' | head -1); \
 			PORT=$${PORT:-8080}; \
 			$(BIN)/python -m umabot.controlpanel --config $(CONFIG_FILE) --no-open --log-level $(LOG_LEVEL) & \
@@ -148,7 +156,7 @@ run: install ## Start in foreground; auto-starts web panel if configured (Ctrl+C
 		$(UMABOT) orchestrate --config $(CONFIG_FILE) --log-level $(LOG_LEVEL); \
 	)
 
-start: install ## Start as background daemon
+start: $(INSTALL_STAMP) ## Start as background daemon
 	@echo "$(BLUE)Starting daemon...$(NC)"
 	@$(UMABOT) start --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
 	@sleep 1
@@ -184,10 +192,10 @@ stop: ## Stop daemon or any foreground UmaBot processes
 
 restart: stop start ## Stop then start daemon
 
-status: install ## Show whether daemon is running
+status: $(INSTALL_STAMP) ## Show whether daemon is running
 	@$(UMABOT) status --config $(CONFIG_FILE) || echo "$(RED)UmaBot is not running$(NC)"
 
-reload: install ## Hot-reload config without restart
+reload: $(INSTALL_STAMP) ## Hot-reload config without restart
 	@echo "$(YELLOW)Reloading config...$(NC)"
 	@$(UMABOT) reload --config $(CONFIG_FILE)
 
@@ -202,7 +210,7 @@ ps: ## List all UmaBot processes
 # Control Panel
 # ---------------------------------------------------------------------------
 
-panel: install ## Start web control panel (installs deps, opens browser)
+panel: $(INSTALL_STAMP) ## Start web control panel (installs deps, opens browser)
 	@echo "$(BLUE)Starting control panel...$(NC)"
 	@$(PIP) install --quiet -e ".[panel]"
 	@$(UMABOT) panel --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
@@ -221,17 +229,17 @@ panel-dev: ## Start frontend HMR dev server (requires 'make run' on :8080)
 # Skills
 # ---------------------------------------------------------------------------
 
-skills: install ## List all loaded skills
+skills: $(INSTALL_STAMP) ## List all loaded skills
 	@$(UMABOT) skills list --config $(CONFIG_FILE)
 
-skill-add: install ## Install a skill  (make skill-add SKILL=<path|url|name>)
+skill-add: $(INSTALL_STAMP) ## Install a skill  (make skill-add SKILL=<path|url|name>)
 	@if [ -z "$(SKILL)" ]; then \
 		echo "$(RED)Usage: make skill-add SKILL=<path|url|name>$(NC)"; exit 1; \
 	fi
 	@$(UMABOT) skills install $(SKILL) --config $(CONFIG_FILE)
 	@echo "$(YELLOW)Run 'make reload' to activate$(NC)"
 
-skill-rm: install ## Remove a skill  (make skill-rm SKILL=<name>)
+skill-rm: $(INSTALL_STAMP) ## Remove a skill  (make skill-rm SKILL=<name>)
 	@if [ -z "$(SKILL)" ]; then \
 		echo "$(RED)Usage: make skill-rm SKILL=<name>$(NC)"; exit 1; \
 	fi
@@ -282,10 +290,10 @@ format: ## Format code with black
 
 check: lint test ## Run lint + test
 
-shell: install ## Open Python REPL with umabot imported
+shell: $(INSTALL_STAMP) ## Open Python REPL with umabot imported
 	@$(BIN)/python -i -c "from umabot import *; print('UmaBot loaded')"
 
-gateway: install ## Start gateway only — no connectors (dev/debug)
+gateway: $(INSTALL_STAMP) ## Start gateway only — no connectors (dev/debug)
 	@echo "$(BLUE)Starting gateway only...$(NC)"
 	@$(BIN)/python -m umabot.gateway --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
 
