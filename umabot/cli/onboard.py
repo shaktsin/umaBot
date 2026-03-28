@@ -18,8 +18,6 @@ from telethon.sessions import StringSession
 from umabot.config.schema import (
     Config,
     ConnectorConfig,
-    ControlPanelConfig,
-    LLMConfig,
     WorkspaceACL,
     WorkspaceConfig,
     default_config,
@@ -84,127 +82,137 @@ def run_wizard(
     new_telegram_token = ""
     new_discord_token = ""
 
-    # ── Step 1: AI Provider ───────────────────────────────────────────────
-    if "llm" in selected:
-        console.print("\n[bold]Step 1: AI Provider[/bold]")
-        provider = questionary.select(
-            "Select your AI provider:",
-            choices=[
-                Choice("OpenAI (GPT-4, GPT-4o)", value="openai"),
-                Choice("Anthropic Claude", value="claude"),
-                Choice("Google Gemini", value="gemini"),
-            ],
-            default=cfg.llm.provider or "openai",
-        ).ask()
-        cfg.llm.provider = provider
+    console.print("[dim]Tip: press Ctrl+C at any time to save progress and exit.[/dim]\n")
 
-        models = _get_models_for_provider(provider)
-        model = questionary.select(
-            f"Select {provider} model:",
-            choices=models,
-        ).ask()
-        cfg.llm.model = model
-
-        if provider == "openai" and _is_reasoning_model(model):
-            effort = questionary.select(
-                "Reasoning effort:",
+    try:
+        # ── Step 1: AI Provider ───────────────────────────────────────────
+        if "llm" in selected:
+            console.print("\n[bold]Step 1: AI Provider[/bold]")
+            provider = questionary.select(
+                "Select your AI provider:",
                 choices=[
-                    Choice("High — best quality", value="high"),
-                    Choice("Medium — balanced (recommended)", value="medium"),
-                    Choice("Low — fastest / cheapest", value="low"),
+                    Choice("OpenAI (GPT-4, GPT-4o)", value="openai"),
+                    Choice("Anthropic Claude", value="claude"),
+                    Choice("Google Gemini", value="gemini"),
                 ],
-                default=cfg.llm.reasoning_effort or "medium",
+                default=cfg.llm.provider or "openai",
             ).ask()
-            cfg.llm.reasoning_effort = effort
+            cfg.llm.provider = provider
 
-        key_hint = " [dim](press Enter to keep existing)[/dim]" if is_update else ""
-        raw = questionary.password(f"Enter {provider} API key:{key_hint}").ask() or ""
-        if raw.strip():
-            new_api_key = raw.strip()
-            cfg.llm.api_key = new_api_key
-        elif is_update:
-            console.print("[dim]  → API key unchanged.[/dim]")
-
-    # ── Step 2: Control Panel ────────────────────────────────────────────
-    if "control_panel" in selected:
-        console.print("\n[bold]Step 2: Control Panel[/bold]")
-        console.print(
-            "[dim]Your private interface for confirmations and management.\n"
-            "You can run multiple control panels (e.g. web + Telegram) simultaneously.[/dim]\n"
-        )
-        new_tokens: dict = {}
-        _step_control_panel(cfg, is_update, new_tokens)
-        new_telegram_token = new_tokens.get("telegram", "")
-        new_discord_token = new_tokens.get("discord", "")
-
-    # ── Step 3: Message Connectors ───────────────────────────────────────
-    if "connectors" in selected:
-        console.print("\n[bold]Step 3: Message Connectors[/bold]")
-        if cfg.connectors:
-            names = ", ".join(c.name for c in cfg.connectors)
-            console.print(f"[dim]Currently configured: {names}[/dim]")
-        console.print("[dim]Add more connectors below — existing ones are kept.[/dim]")
-        _setup_connectors_interactive(cfg)
-
-    # ── Step 4: Integrations ─────────────────────────────────────────────
-    if "integrations" in selected:
-        console.print("\n[bold]Step 4: Integrations[/bold]")
-        console.print(
-            "[dim]Third-party services the bot acts on (not messaging channels).[/dim]\n"
-        )
-        _setup_integrations_interactive(cfg)
-
-    # ── Step 5: Tools & Security ─────────────────────────────────────────
-    if "tools" in selected:
-        console.print("\n[bold]Step 5: Tools[/bold]")
-        current = "[green]enabled[/green]" if cfg.tools.shell_enabled else "[dim]disabled[/dim]"
-        cfg.tools.shell_enabled = questionary.confirm(
-            f"Enable shell command tool? (currently {current})",
-            default=cfg.tools.shell_enabled,
-        ).ask()
-
-        if setup_mode == "advanced":
-            strictness = questionary.select(
-                "Confirmation strictness:",
-                choices=[
-                    Choice("Normal (confirm RED tier only)", value="normal"),
-                    Choice("Strict (confirm all tools)", value="strict"),
-                ],
-                default=cfg.policy.confirmation_strictness or "normal",
+            models = _get_models_for_provider(provider)
+            model = questionary.select(
+                f"Select {provider} model:",
+                choices=models,
             ).ask()
-            cfg.policy.confirmation_strictness = strictness
+            cfg.llm.model = model
 
-    # ── Step 6: Workspaces ───────────────────────────────────────────────
-    if "workspaces" in selected:
-        console.print("\n[bold]Step 6: Workspaces[/bold]")
-        console.print(
-            "[dim]Named directories umabot can read/write. Each has its own ACL.\n"
-            "Agents pick the right workspace per task. No workspace = uses a temp dir.[/dim]\n"
-        )
-        _step_workspaces(cfg)
+            if provider == "openai" and _is_reasoning_model(model):
+                effort = questionary.select(
+                    "Reasoning effort:",
+                    choices=[
+                        Choice("High — best quality", value="high"),
+                        Choice("Medium — balanced (recommended)", value="medium"),
+                        Choice("Low — fastest / cheapest", value="low"),
+                    ],
+                    default=cfg.llm.reasoning_effort or "medium",
+                ).ask()
+                cfg.llm.reasoning_effort = effort
 
-    # ── Step 7: Skills ───────────────────────────────────────────────────
-    if "skills_dirs" in selected:
-        console.print("\n[bold]Step 7: Skills[/bold]")
-        console.print(
-            "[dim]Directories containing Agent Skills (SKILL.md folders).\n"
-            "Each directory is scanned recursively for skills at startup.[/dim]\n"
-        )
-        _step_skill_dirs(cfg)
+            key_hint = " [dim](press Enter to keep existing)[/dim]" if is_update else ""
+            raw = questionary.password(f"Enter {provider} API key:{key_hint}").ask() or ""
+            if raw.strip():
+                new_api_key = raw.strip()
+                cfg.llm.api_key = new_api_key
+            elif is_update:
+                console.print("[dim]  → API key unchanged.[/dim]")
 
-    # ── Step 8: Agents ───────────────────────────────────────────────────
-    if "agents" in selected:
-        console.print("\n[bold]Step 8: Multi-agent orchestration[/bold]")
-        console.print(
-            "[dim]When enabled, requests are routed through a dynamic orchestrator\n"
-            "that spawns specialist agents with tool access and workspace awareness.[/dim]\n"
-        )
-        _step_agents(cfg)
+        # ── Step 2: Control Panel ─────────────────────────────────────────
+        if "control_panel" in selected:
+            console.print("\n[bold]Step 2: Control Panel[/bold]")
+            console.print(
+                "[dim]Your private interface for confirmations and management.\n"
+                "You can run multiple control panels (e.g. web + Telegram) simultaneously.[/dim]\n"
+            )
+            new_tokens: dict = {}
+            _step_control_panel(cfg, is_update, new_tokens)
+            new_telegram_token = new_tokens.get("telegram", "")
+            new_discord_token = new_tokens.get("discord", "")
+
+        # ── Step 3: Integrations ──────────────────────────────────────────
+        if "integrations" in selected:
+            console.print("\n[bold]Step 3: Integrations[/bold]")
+            console.print(
+                "[dim]Third-party services the bot acts on (not messaging channels).[/dim]\n"
+            )
+            _setup_integrations_interactive(cfg)
+
+        # ── Step 4: Message Connectors ────────────────────────────────────
+        if "connectors" in selected:
+            console.print("\n[bold]Step 4: Message Connectors[/bold]")
+            if cfg.connectors:
+                names = ", ".join(c.name for c in cfg.connectors)
+                console.print(f"[dim]Currently configured: {names}[/dim]")
+            console.print("[dim]Add more connectors below — existing ones are kept.[/dim]")
+            _setup_connectors_interactive(cfg)
+
+        # ── Step 5: Tools & Security ──────────────────────────────────────
+        if "tools" in selected:
+            console.print("\n[bold]Step 5: Tools[/bold]")
+            current = "[green]enabled[/green]" if cfg.tools.shell_enabled else "[dim]disabled[/dim]"
+            cfg.tools.shell_enabled = questionary.confirm(
+                f"Enable shell command tool? (currently {current})",
+                default=cfg.tools.shell_enabled,
+            ).ask()
+
+            if setup_mode == "advanced":
+                strictness = questionary.select(
+                    "Confirmation strictness:",
+                    choices=[
+                        Choice("Normal (confirm RED tier only)", value="normal"),
+                        Choice("Strict (confirm all tools)", value="strict"),
+                    ],
+                    default=cfg.policy.confirmation_strictness or "normal",
+                ).ask()
+                cfg.policy.confirmation_strictness = strictness
+
+        # ── Step 6: Workspaces ────────────────────────────────────────────
+        if "workspaces" in selected:
+            console.print("\n[bold]Step 6: Workspaces[/bold]")
+            console.print(
+                "[dim]Named directories umabot can read/write. Each has its own ACL.\n"
+                "Agents pick the right workspace per task. No workspace = uses a temp dir.[/dim]\n"
+            )
+            _step_workspaces(cfg)
+
+        # ── Step 7: Skills ────────────────────────────────────────────────
+        if "skills_dirs" in selected:
+            console.print("\n[bold]Step 7: Skills[/bold]")
+            console.print(
+                "[dim]Directories containing Agent Skills (SKILL.md folders).\n"
+                "Each directory is scanned recursively for skills at startup.[/dim]\n"
+            )
+            _step_skill_dirs(cfg)
+
+        # ── Step 8: Agents ────────────────────────────────────────────────
+        if "agents" in selected:
+            console.print("\n[bold]Step 8: Multi-agent orchestration[/bold]")
+            console.print(
+                "[dim]When enabled, requests are routed through a dynamic orchestrator\n"
+                "that spawns specialist agents with tool access and workspace awareness.[/dim]\n"
+            )
+            _step_agents(cfg)
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Wizard interrupted — saving progress so far...[/yellow]")
 
     # ── Persist ──────────────────────────────────────────────────────────
     # Generate ws_token only if one doesn't already exist
     if not cfg.runtime.ws_token:
         cfg.runtime.ws_token = secrets.token_urlsafe(32)
+
+    # Capture Google client_secret before save_cfg strips it from the YAML
+    google_cfg = getattr(getattr(cfg, "integrations", None), "google", None)
+    new_google_client_secret = (getattr(google_cfg, "client_secret", "") or "") if google_cfg else ""
 
     config_file.parent.mkdir(parents=True, exist_ok=True)
     _ensure_agent_context_file(config_file.parent)
@@ -215,6 +223,7 @@ def run_wizard(
         api_key=new_api_key,
         telegram_token=new_telegram_token,
         discord_token=new_discord_token,
+        google_client_secret=new_google_client_secret,
     )
 
     panel_hint = ""
@@ -413,12 +422,12 @@ def _step_workspaces(cfg: Config) -> None:
             if not path:
                 continue
 
-            can_read    = questionary.confirm("Allow reading files?",           default=True).ask()
-            can_write   = questionary.confirm("Allow writing/modifying files?", default=True).ask()
-            can_create  = questionary.confirm("Allow creating new files?",      default=can_write).ask() if can_write else False
-            can_delete  = questionary.confirm("Allow deleting files?",          default=False).ask() if can_write else False
-            can_shell   = questionary.confirm("Allow shell commands (cwd)?",    default=True).ask()
-            is_default  = questionary.confirm(
+            can_read = questionary.confirm("Allow reading files?", default=True).ask()
+            can_write = questionary.confirm("Allow writing/modifying files?", default=True).ask()
+            can_create = questionary.confirm("Allow creating new files?", default=can_write).ask() if can_write else False
+            can_delete = questionary.confirm("Allow deleting files?", default=False).ask() if can_write else False
+            can_shell = questionary.confirm("Allow shell commands (cwd)?", default=True).ask()
+            is_default = questionary.confirm(
                 "Set as default workspace?",
                 default=not ws_list,
             ).ask()
@@ -571,7 +580,7 @@ def _step_control_panel(cfg: Config, is_update: bool, out_tokens: dict) -> None:
 
     if is_update and all_active:
         active_labels = ", ".join(
-            f"{p.ui_type}{'@'+str(p.web_port) if p.ui_type=='web' else ''}"
+            f"{p.ui_type}{'@' + str(p.web_port) if p.ui_type == 'web' else ''}"
             for p in all_active
         )
         console.print(f"  Active panels: [cyan]{active_labels}[/cyan]\n")
@@ -597,7 +606,7 @@ def _step_control_panel(cfg: Config, is_update: bool, out_tokens: dict) -> None:
                 console.print("[yellow]No panels configured.[/yellow]")
                 continue
             labels = [
-                f"{p.ui_type}{'@'+str(p.web_port) if p.ui_type=='web' else ''}"
+                f"{p.ui_type}{'@' + str(p.web_port) if p.ui_type == 'web' else ''}"
                 for p in all_active
             ]
             idx = questionary.select(
@@ -633,7 +642,7 @@ def _step_control_panel(cfg: Config, is_update: bool, out_tokens: dict) -> None:
             if result:
                 token, chat_id, bot_username = result
                 out_tokens["telegram"] = token
-                connector_name = f"control_panel_tg_{len([p for p in all_active if p.ui_type=='telegram'])+1}"
+                connector_name = f"control_panel_tg_{len([p for p in all_active if p.ui_type == 'telegram']) + 1}"
                 panel = _CPConfig(
                     enabled=True, ui_type="telegram",
                     connector=connector_name, chat_id=chat_id,
@@ -652,7 +661,7 @@ def _step_control_panel(cfg: Config, is_update: bool, out_tokens: dict) -> None:
             token = _prompt_required_secret("Discord bot token:")
             chat_id = questionary.text("Discord channel ID:").ask() or ""
             out_tokens["discord"] = token
-            connector_name = f"control_panel_discord_{len([p for p in all_active if p.ui_type=='discord'])+1}"
+            connector_name = f"control_panel_discord_{len([p for p in all_active if p.ui_type == 'discord']) + 1}"
             panel = _CPConfig(
                 enabled=True, ui_type="discord",
                 connector=connector_name, chat_id=chat_id,
@@ -674,7 +683,7 @@ def _step_control_panel(cfg: Config, is_update: bool, out_tokens: dict) -> None:
 
     if all_active:
         summary = ", ".join(
-            f"{p.ui_type}{'@'+str(p.web_port) if p.ui_type=='web' else ''}"
+            f"{p.ui_type}{'@' + str(p.web_port) if p.ui_type == 'web' else ''}"
             for p in all_active
         )
         console.print(f"[green]✓ Active control panels: {summary}[/green]")
@@ -691,7 +700,7 @@ def _setup_integrations_interactive(cfg: Config) -> None:
             ],
         ).ask()
 
-        if choice == "done":
+        if choice is None or choice == "done":
             break
 
         if choice == "google":
@@ -746,7 +755,8 @@ def _setup_google_workspace(cfg: Config) -> None:
         console.print("[green]✓ Google API libraries already installed.[/green]")
     except ImportError:
         console.print("[yellow]Installing Google API libraries...[/yellow]")
-        import subprocess, sys
+        import subprocess
+        import sys
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q",
              "google-api-python-client>=2.100.0",
@@ -803,6 +813,55 @@ def _setup_google_workspace(cfg: Config) -> None:
             console.print("  Token  : [green]stored[/green]")
         console.print()
 
+        # ── Gmail watch (proactive notifications) ─────────────────────
+        _setup_gmail_watch_interactive(cfg)
+
+
+def _setup_gmail_watch_interactive(cfg: Config) -> None:
+    """Optionally configure a gmail_imap connector for proactive email notifications."""
+    want = questionary.confirm(
+        "Enable proactive Gmail notifications via IMAP? (can skip and add later)",
+        default=False,
+    ).ask()
+    if not want:
+        console.print(
+            "[dim]Skipped. To add later: configure a gmail_imap connector in config.yaml.[/dim]\n"
+        )
+        return
+
+    console.print(
+        "\n[bold cyan]━━━ Gmail IMAP — Proactive Notifications ━━━[/bold cyan]\n"
+        "[dim]Make sure IMAP is enabled in Gmail:\n"
+        "  Gmail → Settings → See all settings → Forwarding and POP/IMAP → Enable IMAP[/dim]\n"
+    )
+
+    mailbox = (
+        questionary.text("IMAP mailbox to watch:", default="INBOX").ask() or "INBOX"
+    ).strip()
+
+    connector_name = (
+        questionary.text("Name for this connector:", default="gmail_imap").ask() or "gmail_imap"
+    ).strip()
+
+    new_connector = ConnectorConfig(
+        name=connector_name,
+        type="gmail_imap",
+        mailbox=mailbox,
+    )
+    if cfg.connectors is None:
+        cfg.connectors = []
+    cfg.connectors.append(new_connector)
+
+    # Describe where notifications will land automatically
+    panel_enabled = getattr(getattr(cfg, "control_panel", None), "enabled", False)
+    notify_target = "local control panel (http://127.0.0.1:8080)" if panel_enabled else "configured control channel"
+
+    console.print(
+        f"\n[green]✓ Gmail IMAP connector '{connector_name}' added.[/green]\n"
+        f"  Mailbox    : {mailbox}\n"
+        f"  Notifies   : {notify_target} (auto-routed)\n"
+    )
+
 
 def _get_models_for_provider(provider: str) -> list:
     """Return available models for a provider."""
@@ -840,17 +899,47 @@ def _setup_connectors_interactive(cfg: Config) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     while True:
+        # Build connector menu — show Gmail option only when Google is configured
+        google_cfg = getattr(getattr(cfg, "integrations", None), "google", None)
+        google_ready = bool(getattr(google_cfg, "client_id", "")) if google_cfg else False
+        gmail_choice = Choice(
+            "Gmail IMAP (proactive email notifications via IMAP IDLE)",
+            value="gmail",
+        )
+        connector_choices = [
+            Choice("Telegram (read all messages via MTProto)", value="telegram"),
+            Choice("Discord (read all messages)", value="discord"),
+        ]
+        if google_ready:
+            connector_choices.append(gmail_choice)
+        else:
+            connector_choices.append(
+                Choice(
+                    "Gmail IMAP (configure Google integration first — Step 3)",
+                    value="gmail_disabled",
+                )
+            )
+        connector_choices.append(Choice("Done adding connectors", value="done"))
+
         connector_type = questionary.select(
             "Add a connector:",
-            choices=[
-                Choice("Telegram (read all messages)", value="telegram"),
-                Choice("Discord (read all messages)", value="discord"),
-                Choice("Done adding connectors", value="done"),
-            ],
+            choices=connector_choices,
         ).ask()
 
-        if connector_type == "done":
+        if connector_type is None or connector_type == "done":
             break
+
+        if connector_type == "gmail_disabled":
+            console.print(
+                "[yellow]Google integration is not configured yet.\n"
+                "Go back to Step 3 (Integrations → Google Workspace) first,[/yellow]\n"
+                "[dim]then re-run 'make init' and choose 'Update existing' to add Gmail IMAP.[/dim]\n"
+            )
+            continue
+
+        if connector_type == "gmail":
+            _setup_gmail_watch_interactive(cfg)
+            continue
 
         connector_name = questionary.text(
             "Connector name (e.g., telegram_main):", default=f"{connector_type}_main"
@@ -914,7 +1003,7 @@ def _prompt_required_secret(prompt: str) -> str:
     while True:
         value = questionary.password(prompt).ask()
         if value is None:
-            raise SystemExit("Onboarding cancelled.")
+            raise KeyboardInterrupt
         text = str(value).strip()
         if text:
             return text

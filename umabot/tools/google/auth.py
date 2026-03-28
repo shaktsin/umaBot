@@ -25,9 +25,9 @@ _AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
 _REVOKE_URI = "https://oauth2.googleapis.com/revoke"
 
-# All scopes needed for Gmail + Calendar + Tasks
+# All scopes needed for Gmail + Calendar + Tasks + IMAP
 _SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",          # IMAP XOAUTH2 (superset of gmail.modify)
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/tasks",
     "openid",

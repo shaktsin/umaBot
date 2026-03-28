@@ -113,6 +113,11 @@ class Database:
                     token_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS gmail_imap_state (
+                    connector TEXT PRIMARY KEY,
+                    last_uid INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
         self._ensure_session_connector()
@@ -244,6 +249,33 @@ class Database:
         with self._lock, self._conn:
             self._conn.execute(
                 "DELETE FROM oauth_tokens WHERE provider = ?", (provider,)
+            )
+
+    # ------------------------------------------------------------------
+    # Gmail IMAP state
+    # ------------------------------------------------------------------
+
+    def get_gmail_imap_last_uid(self, connector: str) -> int:
+        """Return last seen IMAP UID for connector (0 if never seen)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_uid FROM gmail_imap_state WHERE connector = ?",
+                (connector,),
+            ).fetchone()
+        return int(row["last_uid"]) if row else 0
+
+    def set_gmail_imap_last_uid(self, connector: str, uid: int) -> None:
+        """Persist last seen IMAP UID for connector."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO gmail_imap_state (connector, last_uid, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(connector) DO UPDATE
+                    SET last_uid = excluded.last_uid,
+                        updated_at = excluded.updated_at
+                """,
+                (connector, uid, _now()),
             )
 
     # ------------------------------------------------------------------

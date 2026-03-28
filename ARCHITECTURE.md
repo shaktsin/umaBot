@@ -7,65 +7,81 @@ Reference for contributors and advanced users. Covers internals, message flow, t
 ## System Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            USER INTERFACES                                  │
-│                                                                             │
-│  👤 Owner (Control Panel)          👥 External Users                        │
-│  Telegram / Web                    Telegram / Discord                       │
-│        │                                   │                               │
-│        └──────────────┬────────────────────┘                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      CONNECTOR LAYER (Out-of-Process)                       │
-│                                                                             │
-│  ┌───────────────┐  ┌────────────────┐  ┌────────────────┐                 │
-│  │ Control Panel │  │ Telegram Bot   │  │ Telegram User  │  …              │
-│  │   Connector   │  │   Connector    │  │   Connector    │                 │
-│  └──────┬────────┘  └──────┬─────────┘  └──────┬─────────┘                 │
-│         └──────────────────┴──────────────────┘                            │
-│                             │                                               │
-│                    ┌────────▼────────┐                                      │
-│                    │  WebSocket Hub  │  :8765  (token-authenticated)        │
-│                    └────────┬────────┘                                      │
-└─────────────────────────────┼───────────────────────────────────────────────┘
-                               │  ws://
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           GATEWAY PROCESS                                   │
-│                                                                             │
-│  WebSocket Gateway ──▶ Message Router ──▶ Control Panel Manager            │
-│                                │                                            │
-│                                ▼                                            │
-│                        Message Queue (SQLite)                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           WORKER PROCESS                                    │
-│                                                                             │
-│  Worker Event Loop                                                          │
-│       │                                                                     │
-│       ├──▶ LLM Client (Claude / OpenAI / Gemini)                            │
-│       ├──▶ Policy Engine  🟢🟡🔴                                             │
-│       ├──▶ Unified Tool Registry                                            │
-│       │       ├── Built-in tools  (shell.run, file.*, web.*)                │
-│       │       ├── Skill tools     (isolated subprocess + venv)              │
-│       │       └── MCP tools       (JSON-RPC to external servers)            │
-│       └──▶ Task Scheduler  (cron + one-time tasks)                          │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            STORAGE LAYER                                    │
-│                                                                             │
-│  SQLite DB              Vault Dir              Skills Dirs                  │
-│  • messages             • sensitive files      • SKILL.md manifests         │
-│  • sessions             • oauth tokens         • per-skill .venv            │
-│  • tasks / task_runs                           • scripts/                   │
-│  • audit_log                                                                │
-└─────────────────────────────────────────────────────────────────────────────┘
+ LISTENER CONNECTORS  (inbound-only, out-of-process)
+ ┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐
+ │  Gmail IMAP  │  │  Telegram User   │  │  Discord / …     │
+ │  (IMAP IDLE) │  │  (MTProto)       │  │                  │
+ └──────┬───────┘  └──────┬───────────┘  └──────┬───────────┘
+        └─────────────────┴──── WS ──────────────┘
+                                │
+                      ┌─────────▼─────────┐
+                      │   PII Filter       │  email, phone, SSN masked
+                      └─────────┬─────────┘
+                                │
+ ADMIN CONNECTORS  (bidirectional, out-of-process)
+ ┌────────────────────┐  ┌──────────────────────────┐
+ │  Web Panel (local) │  │  Telegram Bot (remote)   │
+ │  127.0.0.1:8080    │  │  control_panel_bot       │
+ └──────────┬─────────┘  └──────────────┬────────────┘
+            └─────────────── WS ─────────┘
+                                │
+                      ┌─────────▼──────────────────────────────────┐
+                      │              GATEWAY  :8765                 │
+                      │                                             │
+                      │  1. Identify connector role (listener|admin)│
+                      │  2. Apply PII filter for listener messages  │
+                      │  3. Pin listener messages → admin session   │
+                      │  4. Persist to DB                           │
+                      │  5. Enqueue to LLM Scheduler (P0/P1/P2)    │
+                      └─────────────────────┬───────────────────────┘
+                                            │
+                      ┌─────────────────────▼───────────────────────┐
+                      │           LLM SCHEDULER                      │
+                      │                                             │
+                      │  P0 = admin message    (no delay)           │
+                      │  P1 = agent tool-loop  (~1 s)               │
+                      │  P2 = listener event   (≥ 60 s gap)         │
+                      │  Token bucket + 429 retry-after             │
+                      └─────────────────────┬───────────────────────┘
+                                            │
+                      ┌─────────────────────▼───────────────────────┐
+                      │           LLM AGENT  (orchestrator)          │
+                      │                                             │
+                      │  • AGENT.md system prompt                   │
+                      │  • Intent detection  (P2 for listener msgs) │
+                      │      → importance / needs_admin / action    │
+                      │  • Built-in tools + Skills + MCP            │
+                      │  • Policy Engine  🟢🟡🔴                    │
+                      │  • Task Scheduler (cron + one-time)         │
+                      └───────────────┬──────────────┬──────────────┘
+                                      │              │
+                          needs_admin │              │ auto-action
+                                      ▼              ▼
+                      ALL admin panels broadcast   Task Store (DB)
+                      Web Panel + Telegram Bot     silent queue
+                      simultaneously
+                                      │
+                          Admin replies → gateway
+                                      │
+                      ┌───────────────▼──────────────────────────────┐
+                      │           REPLY ROUTING                       │
+                      │                                              │
+                      │  source_connector = gmail_imap               │
+                      │    → gmail.send tool (OAuth2)                │
+                      │  source_connector = telegram_user            │
+                      │    → telegram.send_message(source_chat_id)   │
+                      │  source_connector = discord                  │
+                      │    → discord.send(source_chat_id)            │
+                      └──────────────────────────────────────────────┘
+
+ STORAGE LAYER
+ ┌─────────────────────────────────────────────────────────┐
+ │  SQLite DB            Vault Dir          Skills Dirs     │
+ │  messages             oauth tokens       SKILL.md        │
+ │  sessions             sensitive files    per-skill .venv │
+ │  tasks / task_runs                       scripts/        │
+ │  audit_log                                               │
+ └─────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -74,13 +90,16 @@ Reference for contributors and advanced users. Covers internals, message flow, t
 
 | Component | Purpose | Where it runs |
 |-----------|---------|--------------|
-| **Connectors** | Receive/send messages for each channel | Out-of-process workers |
-| **WebSocket Hub** | Routes messages between connectors and gateway | Subprocess inside gateway |
-| **Message Router** | Classifies messages as control vs external | Gateway main loop |
-| **Control Panel Manager** | Dispatches approval requests to the owner | Gateway |
-| **Message Queue** | SQLite-backed durable job queue | Shared between gateway and worker |
-| **Worker** | Claims jobs, runs LLM + tool loop | Async event loop |
-| **LLM Client** | Provider-agnostic Claude/OpenAI/Gemini wrapper | Worker |
+| **Listener connectors** | Inbound-only channels (gmail_imap, telegram_user, discord) | Out-of-process |
+| **Admin connectors** | Bidirectional owner interfaces (web panel, telegram_bot) | Out-of-process |
+| **PII Filter** | Masks email/phone/SSN/IBAN in listener messages before storage | Gateway |
+| **WebSocket Hub** | Routes messages between connectors and gateway | Inside gateway |
+| **Message Router** | Classifies messages as control vs external; assigns connector role | Gateway |
+| **Control Panel Manager** | Broadcasts notifications to ALL enabled admin panels | Gateway |
+| **Message Queue** | SQLite-backed durable job queue | Shared |
+| **LLM Scheduler** | Priority queue (P0/P1/P2) + token bucket + 429 retry | Worker |
+| **Worker** | Claims jobs, runs intent detection + LLM + tool loop | Async event loop |
+| **Intent Detector** | Lightweight P2 LLM call to classify listener messages | Worker |
 | **Policy Engine** | Assigns risk tier, manages confirmation tokens | Worker |
 | **Unified Tool Registry** | Routes tool calls to built-ins, skills, or MCP | Worker |
 | **Task Scheduler** | Enqueues periodic and one-time tasks | Separate asyncio loop |
@@ -88,32 +107,80 @@ Reference for contributors and advanced users. Covers internals, message flow, t
 
 ---
 
-## Message Flow
+## Connector Roles: Listener vs Admin
+
+Every connector is automatically assigned a role based on its `type`.  The role
+is never set manually in `config.yaml` — it is derived by `ConnectorConfig.__post_init__`.
+
+| Role | Types | Behaviour |
+|------|-------|-----------|
+| **listener** | `gmail_imap`, `telegram_user`, `discord` | Inbound-only. PII filtered. Messages pinned to admin session. No direct replies. |
+| **admin** | `telegram_bot`, `web` (control panel) | Bidirectional. Trusted. Receives all notifications. Admin replies are processed here. |
+
+### Listener message lifecycle
 
 ```
-User sends message
+Listener connector sends WS event
+        │
+        ▼
+Gateway: connector_role = get_connector_role(config, connector)  → "listener"
+        │
+        ├─ filter_pii(message.text)         ← mask email/phone/SSN before DB
+        ├─ session pinned to admin session  ← chat_id="admin", channel="web"
+        ├─ source_connector + source_chat_id preserved in queue payload
+        │
+        ▼
+Worker: detect_intent(text, llm_client, priority=P2)
+        │  → IntentResult(importance, needs_admin, suggested_action, summary)
+        │
+        ├─ should_skip (ignore + low)?  → discard silently, no LLM cost
+        │
+        ├─ prepend intent_context_block to LLM messages
+        │    [Intent detection]
+        │    Importance:       high
+        │    Suggested action: draft_reply
+        │    Source connector: gmail_imap
+        │    To reply: use the gmail.send tool
+        │
+        ▼
+LLM agent runs (full orchestrator or direct)
+        │
+        ▼
+_notify(connector_role="listener") → send_control_message()
+        │                              → ALL admin panels simultaneously
+        ▼
+Admin sees summary + draft reply on web panel AND Telegram bot
+Admin replies → LLM uses gmail.send / telegram.send_message / discord.send
+```
+
+---
+
+## Message Flow (Admin connector)
+
+```
+Admin / user sends message
       │
-      ├─ [1]  Connector receives (Telegram long-poll / Discord WS)
+      ├─ [1]  Connector receives (Telegram long-poll / web panel WS)
       ├─ [2]  Sent over WebSocket to Gateway Hub
-      ├─ [3]  Message Router classifies:
-      │          control message?  → Control Panel Manager
-      │          external message? → Message Queue (SQLite)
-      ├─ [4]  Worker claims job from queue
-      ├─ [5]  Worker detects workspace from message text; sets active workspace
-      ├─ [6]  LLM receives message + system prompt (skills catalog, workspace catalog)
+      ├─ [3]  connector_role = "admin" → normal session (no pinning, no PII filter)
+      ├─ [4]  Message Router classifies: control | external
+      ├─ [5]  Enqueued with connector_role="admin", P1 priority
+      ├─ [6]  Worker claims job
+      ├─ [7]  Worker detects workspace; sets active workspace
+      ├─ [8]  LLM receives message + AGENT.md + skills catalog
       │
       │  LLM tool loop:
-      ├─ [7]  LLM requests a tool call
-      ├─ [8]  Policy Engine checks risk tier
+      ├─ [9]  LLM requests a tool call
+      ├─ [10] Policy Engine checks risk tier
       │          🟢 GREEN  → auto-approve
       │          🟡 YELLOW → auto-approve (strict mode: approval required)
-      │          🔴 RED    → send approval request to control panel; block until response
-      ├─ [9]  Tool executes (in-process / subprocess / JSON-RPC)
-      ├─ [10] Result returned to LLM; loop continues until no more tool calls
+      │          🔴 RED    → approval request to ALL admin panels; block until response
+      ├─ [11] Tool executes (in-process / subprocess / JSON-RPC)
+      ├─ [12] Result returned to LLM; loop continues until no more tool calls
       │
-      ├─ [11] LLM generates final response
-      ├─ [12] Response routed back via WebSocket Hub → original connector
-      └─ [13] User receives reply
+      ├─ [13] LLM generates final response
+      ├─ [14] _notify(connector_role="admin") → send_message() → originating connector
+      └─ [15] Admin receives reply
 ```
 
 ---
@@ -191,10 +258,56 @@ At startup and on `make reload`:
 
 ---
 
+## LLM Scheduler
+
+All LLM calls go through `LLMScheduler` (`umabot/llm/scheduler.py`), which wraps any provider client with a priority queue and rate limiter.
+
+```
+Priority levels:
+  P0 = 0  Admin message / urgent command       → no delay, preempts queue
+  P1 = 1  Agent tool-loop iteration (default)  → normal, ~1 s
+  P2 = 2  Background / listener event          → min 60 s between calls
+
+Token bucket:  sliding 60-second window (tokens_per_minute in config)
+429 / 529:     exponential backoff with retry-after header respected
+```
+
+Three separate schedulers run concurrently — one for `llm_client`, one for `orchestrator_llm`, one for `agent_llm` — each wrapping their own provider client.  All are started in `Worker.start()` and stopped in `Worker.stop()`.
+
+---
+
+## Intent Detection
+
+When a message arrives from a **listener connector**, the worker runs a lightweight P2 LLM call before the full agent loop:
+
+```python
+intent = await detect_intent(text, llm_client)   # P2 — cheap, fast
+# IntentResult fields:
+#   importance:        "high" | "medium" | "low"
+#   needs_admin:       True | False
+#   suggested_action:  "summarize" | "draft_reply" | "create_task" | "ignore"
+#   summary:           "1-2 sentence plain English summary"
+
+if intent.should_skip:   # ignore + low → no LLM cost, silent discard
+    return
+
+# Otherwise prepend intent context to agent conversation:
+# [Intent detection]
+# Importance:       high
+# Suggested action: draft_reply
+# Source connector: gmail_imap
+# To reply: use the gmail.send tool (include the original Subject as Re: <Subject>)
+```
+
+Fallback: if intent detection itself fails, `_FALLBACK` is used (`medium` / `needs_admin=True` / `summarize`) so the message always reaches the admin.
+
+---
+
 ## Security Layers
 
 | Layer | Mechanism |
 |-------|----------|
+| **PII filter** | Email / phone / SSN / IBAN masked in listener messages before DB storage |
 | **Input validation** | JSON Schema on every tool call argument |
 | **Risk tiers** | GREEN / YELLOW / RED assigned per tool |
 | **RED confirmation** | Single-use 128-bit token, expires on use or timeout |

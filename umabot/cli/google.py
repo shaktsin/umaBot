@@ -11,12 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger("umabot.cli.google")
@@ -96,7 +94,7 @@ def run_oauth_login(client_id: str, client_secret: str, db) -> bool:
     redirect_uri = f"http://127.0.0.1:{_OAUTH_CALLBACK_PORT}/callback"
     auth_url, state = build_auth_url(client_id, redirect_uri)
 
-    print(f"\n─── Google Login ─────────────────────────────────────────────────")
+    print("\n─── Google Login ─────────────────────────────────────────────────")
     print("Opening browser for Google login...")
     print(f"If the browser does not open, visit:\n  {auth_url}\n")
 
@@ -112,7 +110,12 @@ def run_oauth_login(client_id: str, client_secret: str, db) -> bool:
     webbrowser.open(auth_url)
 
     print("Waiting for Google to redirect back... (Ctrl+C to cancel)\n")
-    thread.join(timeout=120)
+    try:
+        thread.join(timeout=120)
+    except KeyboardInterrupt:
+        print("\n⚠  OAuth login cancelled.")
+        server.server_close()
+        raise
     server.server_close()
 
     if result.get("error"):
@@ -259,7 +262,6 @@ def _parse_client_secret_json(path: str):
     client_id = creds.get("client_id", "").strip()
     client_secret = creds.get("client_secret", "").strip()
     return client_id, client_secret
-
 
 
 class _CallbackServer(HTTPServer):
