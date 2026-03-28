@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import io
 import logging
 import os
 from typing import Optional
@@ -187,6 +189,8 @@ class TelegramUserConnector(BaseConnector):
                         chat_id = data.get("chat_id", "")
                         text = data.get("text", "")
                         await self._send_message(client, chat_id, text)
+                        for attachment in data.get("attachments") or []:
+                            await self._send_attachment(client, chat_id, attachment)
                 elif msg.type in {WSMsgType.CLOSE, WSMsgType.ERROR}:
                     break
         except asyncio.CancelledError:
@@ -249,6 +253,34 @@ class TelegramUserConnector(BaseConnector):
 
         cb.record_failure()
         logger.error("Gave up sending to chat_id=%s after %d attempts", chat_id, max_retries)
+
+    async def _send_attachment(self, client: TelegramClient, chat_id: str, attachment: dict) -> None:
+        """Send a binary attachment via Telethon send_file()."""
+        if not chat_id:
+            return
+        cb = self._circuit_breakers.get(chat_id)
+        if cb.is_open():
+            logger.warning("Circuit open for chat_id=%s — dropping attachment", chat_id)
+            return
+
+        filename = attachment.get("filename", "file")
+        mime_type = attachment.get("mime_type", "application/octet-stream")
+        raw = base64.b64decode(attachment.get("data", ""))
+        file_obj = io.BytesIO(raw)
+        file_obj.name = filename
+
+        await self._rate_limiter.acquire(chat_id)
+        try:
+            await client.send_file(int(chat_id), file_obj, force_document=(not mime_type.startswith("image/")))
+            cb.record_success()
+            logger.debug("Sent attachment chat_id=%s filename=%s", chat_id, filename)
+        except FloodWaitError as exc:
+            wait = exc.seconds + 2
+            logger.warning("FloodWait %ds sending attachment chat_id=%s", wait, chat_id)
+            await asyncio.sleep(wait)
+        except Exception as exc:
+            cb.record_failure()
+            logger.error("Failed to send attachment chat_id=%s filename=%s: %s", chat_id, filename, exc)
 
     async def health_check(self) -> ConnectorStatus:
         """Return current health status."""

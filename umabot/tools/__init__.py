@@ -1,6 +1,6 @@
 from .builtin import register_builtin_tools
 from .google import register_google_tools
-from .registry import Tool, ToolRegistry, ToolResult
+from .registry import Attachment, Tool, ToolRegistry, ToolResult
 from .unified_registry import UnifiedToolRegistry, ToolInfo, ToolSource
 from .workspace import (
     detect_workspace_from_text,
@@ -11,6 +11,7 @@ from .workspace import (
 )
 
 __all__ = [
+    "Attachment",
     "Tool",
     "ToolRegistry",
     "ToolResult",

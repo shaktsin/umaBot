@@ -134,5 +134,6 @@ class GatewayConnector:
                     },
                 )
 
+        attachments = data.get("attachments") or None
         if self._broadcaster:
-            await self._broadcaster.broadcast_chat("assistant", text, chat_id)
+            await self._broadcaster.broadcast_chat("assistant", text, chat_id, attachments=attachments)

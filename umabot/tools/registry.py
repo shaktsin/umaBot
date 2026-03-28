@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional
+import base64
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from jsonschema import validate
 from jsonschema.exceptions import ValidationError
@@ -12,6 +13,29 @@ RiskLevel = str
 RISK_GREEN: RiskLevel = "GREEN"
 RISK_YELLOW: RiskLevel = "YELLOW"
 RISK_RED: RiskLevel = "RED"
+
+
+@dataclass
+class Attachment:
+    """Binary attachment (image, PDF, document) to be sent alongside a text response."""
+    filename: str
+    mime_type: str
+    data: bytes
+
+    def to_dict(self) -> dict:
+        return {
+            "filename": self.filename,
+            "mime_type": self.mime_type,
+            "data": base64.b64encode(self.data).decode(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Attachment":
+        return cls(
+            filename=d["filename"],
+            mime_type=d["mime_type"],
+            data=base64.b64decode(d["data"]),
+        )
 
 
 @dataclass
@@ -27,6 +51,7 @@ class Tool:
 class ToolResult:
     content: str
     data: Optional[Dict[str, Any]] = None
+    attachments: List[Attachment] = field(default_factory=list)
 
 
 class ToolRegistry:

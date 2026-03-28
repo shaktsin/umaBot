@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from umabot.config import load_config, parse_override_args
+from umabot.config.schema import get_connector_role
+from umabot.security import filter_pii
 from umabot.control_panel import ControlPanelManager
 from umabot.models import IncomingMessage
 from umabot.policy import PolicyEngine
@@ -134,8 +136,15 @@ class Gateway:
         await self._scheduler.start()
         logger.info("Reload complete")
 
-    async def send_message(self, channel: str, chat_id: str, text: str, connector: str = "") -> None:
-        if not await self._hub.send(channel, connector, chat_id, text):
+    async def send_message(
+        self,
+        channel: str,
+        chat_id: str,
+        text: str,
+        connector: str = "",
+        attachments: Optional[list] = None,
+    ) -> None:
+        if not await self._hub.send(channel, connector, chat_id, text, attachments=attachments):
             logger.warning("No connector available for channel=%s connector=%s", channel, connector)
 
     async def send_confirmation_request(
@@ -230,6 +239,7 @@ class Gateway:
                 "type": "message",
                 "kind": routed.kind,
                 "connector": "",
+                "connector_role": "admin",
                 "chat_id": message.chat_id,
                 "channel": message.channel,
                 "session_id": session_id,
@@ -238,12 +248,20 @@ class Gateway:
         )
 
     async def _on_ws_event(self, connector: str, channel: str, mode: str, data: dict) -> None:
+        # Optional cross-connector reply routing (used by e.g. gmail_watch connector)
+        reply_connector = str(data.get("reply_connector", ""))
+        reply_chat_id = str(data.get("reply_chat_id", ""))
+        reply_channel = str(data.get("reply_channel", ""))
+
         message = IncomingMessage(
             channel=channel,
             chat_id=str(data.get("chat_id", "")),
             user_id=str(data.get("user_id", "")),
             text=str(data.get("text", "")),
             connector=connector,
+            reply_connector=reply_connector,
+            reply_chat_id=reply_chat_id,
+            reply_channel=reply_channel,
         )
         kind_hint = "control" if mode == "control" else None
         routed = self._router.route(message, kind_hint=kind_hint)
@@ -276,19 +294,58 @@ class Gateway:
             )
             return
 
-        session_id = self.db.get_or_create_session(message.chat_id, message.channel, connector=connector)
-        self.db.add_message(session_id, "user", message.text)
+        # Listener connectors (gmail_imap, telegram_user, discord, …) are
+        # inbound-only and have no direct reply path.  Pin their messages into
+        # the admin session so the control panel has full context and the admin
+        # can follow up naturally.
+        connector_role = get_connector_role(self.config, connector)
+        # Preserve originating connector/chat before session pinning so the
+        # worker can include them in the LLM context for reply routing.
+        source_connector = connector
+        source_chat_id = message.chat_id
+
+        if connector_role == "listener":
+            from umabot.controlpanel.connector import PANEL_CHAT_ID, PANEL_CHANNEL, PANEL_CONNECTOR
+            session_chat_id = PANEL_CHAT_ID       # "admin"
+            session_channel = PANEL_CHANNEL       # "web"
+            session_connector = PANEL_CONNECTOR   # "web-panel"
+            logger.debug(
+                "Listener connector=%s (source_chat_id=%s) pinned to admin session",
+                connector, message.chat_id,
+            )
+            # Apply PII filter to listener messages before storing or forwarding.
+            # Admin connector messages are trusted and not filtered.
+            inbound_text = filter_pii(message.text)
+            if inbound_text != message.text:
+                logger.debug("PII filter redacted content from connector=%s", connector)
+        else:
+            session_chat_id = message.chat_id
+            session_channel = message.channel
+            session_connector = connector
+            inbound_text = message.text
+
+        session_id = self.db.get_or_create_session(session_chat_id, session_channel, connector=session_connector)
+        # Listener messages are NOT stored in the session as "user" turns.
+        # Raw emails / Telegram messages can be large (up to 4 KB each) and would
+        # bloat the DB and pollute the admin session context.  Only the LLM's
+        # summary response is persisted (saved by the worker after processing).
+        # Admin messages (connector_role="admin") are stored normally.
+        if connector_role != "listener":
+            self.db.add_message(session_id, "user", inbound_text)
         await self.queue.enqueue(
-            message.chat_id,
-            message.channel,
+            session_chat_id,
+            session_channel,
             {
                 "type": "message",
                 "kind": routed.kind,
-                "connector": connector,
-                "chat_id": message.chat_id,
-                "channel": message.channel,
+                "connector": session_connector,
+                "connector_role": connector_role,
+                "source_connector": source_connector,
+                "source_chat_id": source_chat_id,
+                "chat_id": session_chat_id,
+                "channel": session_channel,
                 "session_id": session_id,
-                "text": message.text,
+                "text": inbound_text,
             },
         )
 
