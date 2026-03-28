@@ -1,93 +1,139 @@
-.PHONY: help install dev-install panel-install clean test lint format run run-debug start stop status reload skills doctor setup panel panel-build panel-dev
+.PHONY: help install dev upgrade init run start stop restart status reload logs ps \
+        panel panel-build panel-dev \
+        skills skill-add skill-rm \
+        test lint format check shell gateway \
+        config edit \
+        db db-backup db-reset \
+        reset clean \
+        build publish-test publish \
+        info doctor
 
-# Default Python
-PYTHON := python3
-VENV := .venv
-BIN := $(VENV)/bin
-PIP := $(BIN)/pip
-UMABOT := $(BIN)/umabot
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
 
-# Configuration
-CONFIG_DIR := $(HOME)/.umabot
+PYTHON    := python3
+VENV      := .venv
+BIN       := $(VENV)/bin
+PIP       := $(BIN)/pip
+UMABOT    := $(BIN)/umabot
+
+CONFIG_DIR  := $(HOME)/.umabot
 CONFIG_FILE := $(CONFIG_DIR)/config.yaml
-LOG_LEVEL := DEBUG
+LOG_LEVEL   := DEBUG
 
-# Colors for output
-BLUE := \033[0;34m
-GREEN := \033[0;32m
+# Colors
+BLUE   := \033[0;34m
+GREEN  := \033[0;32m
 YELLOW := \033[0;33m
-RED := \033[0;31m
-NC := \033[0m # No Color
+RED    := \033[0;31m
+NC     := \033[0m
 
-help: ## Show this help message
-	@echo "$(BLUE)UmaBot - Self-hosted AI Assistant$(NC)"
-	@echo ""
-	@echo "$(GREEN)Configuration:$(NC)"
-	@echo "  Config:    $(CONFIG_FILE)"
-	@echo "  Log Level: $(LOG_LEVEL) (change in Makefile)"
-	@echo ""
-	@echo "$(GREEN)Available targets:$(NC)"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(YELLOW)%-20s$(NC) %s\n", $$1, $$2}'
-	@echo ""
-	@echo "$(GREEN)Examples:$(NC)"
-	@echo "  make install          # First-time setup"
-	@echo "  make init             # Configure UmaBot (with control panel)"
-	@echo "  make run              # Run in foreground"
-	@echo "  make start            # Start as daemon"
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
 
-##@ Installation
+help: ## Show this help
+	@echo "$(BLUE)UmaBot — Self-hosted AI Assistant$(NC)"
+	@echo ""
+	@echo "$(GREEN)Config:$(NC)  $(CONFIG_FILE)"
+	@echo "$(GREEN)Venv:$(NC)    $(VENV)"
+	@echo ""
+	@echo "$(GREEN)Setup$(NC)"
+	@echo "  $(YELLOW)install$(NC)       Create venv and install dependencies"
+	@echo "  $(YELLOW)dev$(NC)           Install with dev dependencies (pytest, black, mypy…)"
+	@echo "  $(YELLOW)upgrade$(NC)       Upgrade all installed dependencies"
+	@echo "  $(YELLOW)init$(NC)          Run interactive configuration wizard"
+	@echo "  $(YELLOW)doctor$(NC)        Check config, connectors, and skill health"
+	@echo ""
+	@echo "$(GREEN)Run$(NC)"
+	@echo "  $(YELLOW)run$(NC)           Start in foreground (Ctrl+C to stop); auto-starts web panel"
+	@echo "  $(YELLOW)start$(NC)         Start as background daemon"
+	@echo "  $(YELLOW)stop$(NC)          Stop daemon or foreground processes"
+	@echo "  $(YELLOW)restart$(NC)       Stop then start daemon"
+	@echo "  $(YELLOW)status$(NC)        Show whether daemon is running"
+	@echo "  $(YELLOW)reload$(NC)        Hot-reload config without restart"
+	@echo "  $(YELLOW)logs$(NC)          Tail the live log file"
+	@echo "  $(YELLOW)ps$(NC)            List all UmaBot processes"
+	@echo ""
+	@echo "$(GREEN)Control Panel$(NC)"
+	@echo "  $(YELLOW)panel$(NC)         Start web control panel (installs deps, opens browser)"
+	@echo "  $(YELLOW)panel-build$(NC)   Build React frontend → umabot/controlpanel/static/"
+	@echo "  $(YELLOW)panel-dev$(NC)     Start frontend HMR dev server (needs 'make run' on :8080)"
+	@echo ""
+	@echo "$(GREEN)Skills$(NC)"
+	@echo "  $(YELLOW)skills$(NC)        List all loaded skills"
+	@echo "  $(YELLOW)skill-add$(NC)     Install a skill:  make skill-add SKILL=<path|url|name>"
+	@echo "  $(YELLOW)skill-rm$(NC)      Remove a skill:   make skill-rm  SKILL=<name>"
+	@echo ""
+	@echo "$(GREEN)Config & DB$(NC)"
+	@echo "  $(YELLOW)config$(NC)        Print current config.yaml"
+	@echo "  $(YELLOW)edit$(NC)          Open config.yaml in \$$EDITOR"
+	@echo "  $(YELLOW)db$(NC)            Open SQLite shell"
+	@echo "  $(YELLOW)db-backup$(NC)     Backup database to ~/.umabot/backups/"
+	@echo "  $(YELLOW)db-reset$(NC)      Delete database (keep config)"
+	@echo ""
+	@echo "$(GREEN)Development$(NC)"
+	@echo "  $(YELLOW)test$(NC)          Run pytest"
+	@echo "  $(YELLOW)lint$(NC)          Run flake8 + mypy"
+	@echo "  $(YELLOW)format$(NC)        Format code with black"
+	@echo "  $(YELLOW)check$(NC)         lint + test"
+	@echo "  $(YELLOW)shell$(NC)         Python REPL with umabot imported"
+	@echo "  $(YELLOW)gateway$(NC)       Start gateway only (no connectors, for dev)"
+	@echo ""
+	@echo "$(GREEN)Cleanup$(NC)"
+	@echo "  $(YELLOW)reset$(NC)         Wipe ~/.umabot/ + sessions, keep .venv  →  re-run 'make init'"
+	@echo "  $(YELLOW)clean$(NC)         Nuke everything: .venv + ~/.umabot/ + sessions  →  clean slate"
+	@echo ""
+	@echo "$(GREEN)Release$(NC)"
+	@echo "  $(YELLOW)build$(NC)         Build dist packages"
+	@echo "  $(YELLOW)publish-test$(NC)  Upload to TestPyPI"
+	@echo "  $(YELLOW)publish$(NC)       Upload to PyPI"
+	@echo "  $(YELLOW)info$(NC)          Show system/path information"
 
-install: ## Install UmaBot (create venv, install deps)
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+install: ## Create venv and install dependencies
 	@echo "$(BLUE)Installing UmaBot...$(NC)"
 	@if [ ! -d "$(VENV)" ]; then \
 		echo "$(YELLOW)Creating virtual environment...$(NC)"; \
 		$(PYTHON) -m venv $(VENV); \
 	fi
-	@echo "$(YELLOW)Installing dependencies...$(NC)"
-	@$(PIP) install --upgrade pip
+	@$(PIP) install --quiet --upgrade pip
 	@$(PIP) install -e .
-	@echo "$(GREEN)✓ Installation complete!$(NC)"
-	@echo ""
-	@echo "$(BLUE)Next steps:$(NC)"
-	@echo "  1. Configure UmaBot:          $(YELLOW)make init$(NC)"
-	@echo "  2. Install panel deps:        $(YELLOW)make panel-install$(NC)"
-	@echo "  3. Build frontend:            $(YELLOW)make panel-build$(NC)"
-	@echo "  4. Run everything:            $(YELLOW)make run$(NC)"
-	@echo ""
-	@echo "$(GREEN)Config will be saved to: $(CONFIG_FILE)$(NC)"
+	@echo "$(GREEN)✓ Done. Run 'make init' to configure.$(NC)"
 
-dev-install: ## Install with development dependencies
-	@echo "$(BLUE)Installing UmaBot (development mode)...$(NC)"
-	@if [ ! -d "$(VENV)" ]; then \
-		echo "$(YELLOW)Creating virtual environment...$(NC)"; \
-		$(PYTHON) -m venv $(VENV); \
-	fi
-	@$(PIP) install --upgrade pip
+dev: ## Install with dev dependencies (pytest, black, mypy, flake8)
+	@echo "$(BLUE)Installing dev dependencies...$(NC)"
+	@if [ ! -d "$(VENV)" ]; then $(PYTHON) -m venv $(VENV); fi
+	@$(PIP) install --quiet --upgrade pip
 	@$(PIP) install -e ".[dev]"
-	@echo "$(GREEN)✓ Development installation complete!$(NC)"
+	@echo "$(GREEN)✓ Dev install complete.$(NC)"
 
-upgrade: ## Upgrade dependencies
+upgrade: ## Upgrade all installed dependencies
 	@echo "$(YELLOW)Upgrading dependencies...$(NC)"
-	@$(PIP) install --upgrade pip
+	@$(PIP) install --quiet --upgrade pip
 	@$(PIP) install --upgrade -e .
-	@echo "$(GREEN)✓ Dependencies upgraded!$(NC)"
+	@echo "$(GREEN)✓ Upgraded.$(NC)"
 
-##@ Configuration
-
-init: install ## Run interactive configuration wizard (includes control panel setup)
+init: install ## Run interactive configuration wizard
 	@echo "$(BLUE)Running configuration wizard...$(NC)"
 	@mkdir -p $(CONFIG_DIR)
 	@$(UMABOT) onboard --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
 
-doctor: install ## Run system diagnostics
+doctor: install ## Check config, connectors, and skill health
 	@echo "$(BLUE)Running diagnostics...$(NC)"
 	@$(UMABOT) doctor --config $(CONFIG_FILE) --log-level $(LOG_LEVEL) || true
 
-##@ Running
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
 
-run: install ## Run UmaBot in foreground (gateway + connectors + panel if configured)
-	@echo "$(BLUE)Starting UmaBot in foreground...$(NC)"
-	@echo "$(YELLOW)Press Ctrl+C to stop$(NC)"
+run: install ## Start in foreground; auto-starts web panel if configured (Ctrl+C to stop)
+	@echo "$(BLUE)Starting UmaBot...$(NC)"
+	@echo "$(YELLOW)Ctrl+C to stop$(NC)"
 	@( \
 		PANEL_PID=""; \
 		if grep -q "ui_type: web" $(CONFIG_FILE) 2>/dev/null && grep -q "enabled: true" $(CONFIG_FILE) 2>/dev/null; then \
@@ -95,85 +141,37 @@ run: install ## Run UmaBot in foreground (gateway + connectors + panel if config
 			PORT=$${PORT:-8080}; \
 			$(BIN)/python -m umabot.controlpanel --config $(CONFIG_FILE) --no-open --log-level $(LOG_LEVEL) & \
 			PANEL_PID=$$!; \
-			echo "$(GREEN)✓ Control panel starting → http://127.0.0.1:$$PORT$(NC)"; \
+			echo "$(GREEN)✓ Panel → http://127.0.0.1:$$PORT$(NC)"; \
 		fi; \
 		cleanup() { [ -n "$$PANEL_PID" ] && kill "$$PANEL_PID" 2>/dev/null; }; \
 		trap cleanup EXIT INT TERM; \
 		$(UMABOT) orchestrate --config $(CONFIG_FILE) --log-level $(LOG_LEVEL); \
 	)
 
-run-debug: install ## Run in foreground with DEBUG logging
-	@echo "$(BLUE)Starting UmaBot in DEBUG mode...$(NC)"
-	@echo "$(YELLOW)Press Ctrl+C to stop$(NC)"
-	@( \
-		PANEL_PID=""; \
-		if grep -q "ui_type: web" $(CONFIG_FILE) 2>/dev/null && grep -q "enabled: true" $(CONFIG_FILE) 2>/dev/null; then \
-			PORT=$$(grep 'web_port' $(CONFIG_FILE) 2>/dev/null | awk '{print $$2}' | head -1); \
-			PORT=$${PORT:-8080}; \
-			$(BIN)/python -m umabot.controlpanel --config $(CONFIG_FILE) --no-open --log-level DEBUG & \
-			PANEL_PID=$$!; \
-			echo "$(GREEN)✓ Control panel starting → http://127.0.0.1:$$PORT$(NC)"; \
-		fi; \
-		cleanup() { [ -n "$$PANEL_PID" ] && kill "$$PANEL_PID" 2>/dev/null; }; \
-		trap cleanup EXIT INT TERM; \
-		$(UMABOT) orchestrate --config $(CONFIG_FILE) --log-level DEBUG; \
-	)
-
-run-gateway: install ## Run only gateway (no connectors)
-	@echo "$(BLUE)Starting gateway only...$(NC)"
-	@$(BIN)/python -m umabot.gateway --config $(CONFIG_FILE) --log-level DEBUG
-
-##@ Control Panel
-
-panel-install: ## Install control panel dependencies (fastapi + uvicorn)
-	@echo "$(BLUE)Installing control panel dependencies...$(NC)"
-	@$(PIP) install -e ".[panel]"
-	@echo "$(GREEN)✓ Panel dependencies installed$(NC)"
-
-panel: panel-install ## Start the web control panel (opens browser)
-	@echo "$(BLUE)Starting control panel...$(NC)"
-	@$(UMABOT) panel --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
-
-panel-build: ## Build the frontend (outputs to umabot/controlpanel/static/)
-	@echo "$(BLUE)Building control panel frontend...$(NC)"
-	@cd umabot/controlpanel/frontend && npm install && npm run build
-	@echo "$(GREEN)✓ Frontend built → umabot/controlpanel/static/$(NC)"
-
-panel-dev: ## Start frontend dev server with HMR (requires gateway + panel running separately)
-	@echo "$(BLUE)Starting frontend dev server on http://localhost:5173$(NC)"
-	@echo "$(YELLOW)Make sure 'make run' or 'make panel' is running on port 8080$(NC)"
-	@cd umabot/controlpanel/frontend && npm run dev
-
-##@ Daemon Management
-
-start: install ## Start UmaBot daemon
-	@echo "$(BLUE)Starting UmaBot daemon...$(NC)"
+start: install ## Start as background daemon
+	@echo "$(BLUE)Starting daemon...$(NC)"
 	@$(UMABOT) start --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
 	@sleep 1
 	@$(MAKE) status
 
-stop: ## Stop all UmaBot processes (daemon PID file + any foreground make run/start processes)
+stop: ## Stop daemon or any foreground UmaBot processes
 	@echo "$(YELLOW)Stopping UmaBot...$(NC)"
-	@# 1. Daemon mode: kill via PID file written by `make start`
 	@PID_FILE="$(CONFIG_DIR)/umabot.pid"; \
 	if [ -f "$$PID_FILE" ]; then \
 		PID=$$(cat "$$PID_FILE" 2>/dev/null); \
 		if [ -n "$$PID" ] && kill -0 "$$PID" 2>/dev/null; then \
-			echo "  $(YELLOW)Stopping daemon PID=$$PID$(NC)"; \
+			echo "  Stopping daemon PID=$$PID"; \
 			kill -TERM "$$PID" 2>/dev/null || true; \
 		fi; \
 		rm -f "$$PID_FILE"; \
 	fi
-	@# 2. Foreground mode: kill processes started by `make run` / `make run-debug`
-	@#    Patterns match: `umabot orchestrate`, `umabot.controlpanel`, `umabot.gateway`
 	@for pat in "umabot orchestrate" "umabot.controlpanel" "umabot.gateway"; do \
 		pids=$$(pgrep -f "$$pat" 2>/dev/null); \
 		if [ -n "$$pids" ]; then \
-			echo "  $(YELLOW)Stopping $$pat (PID $$pids)$(NC)"; \
+			echo "  Stopping $$pat (PID $$pids)"; \
 			kill -TERM $$pids 2>/dev/null || true; \
 		fi; \
 	done
-	@# 3. Give processes a moment to exit gracefully, then force-kill stragglers
 	@sleep 1
 	@for pat in "umabot orchestrate" "umabot.controlpanel" "umabot.gateway"; do \
 		pids=$$(pgrep -f "$$pat" 2>/dev/null); \
@@ -182,195 +180,167 @@ stop: ## Stop all UmaBot processes (daemon PID file + any foreground make run/st
 			kill -KILL $$pids 2>/dev/null || true; \
 		fi; \
 	done
-	@echo "$(GREEN)✓ All UmaBot processes stopped$(NC)"
+	@echo "$(GREEN)✓ Stopped$(NC)"
 
-restart: stop start ## Restart UmaBot daemon
+restart: stop start ## Stop then start daemon
 
-status: ## Show daemon status
+status: install ## Show whether daemon is running
 	@$(UMABOT) status --config $(CONFIG_FILE) || echo "$(RED)UmaBot is not running$(NC)"
 
-reload: ## Reload configuration (hot reload)
-	@echo "$(YELLOW)Reloading configuration...$(NC)"
+reload: install ## Hot-reload config without restart
+	@echo "$(YELLOW)Reloading config...$(NC)"
 	@$(UMABOT) reload --config $(CONFIG_FILE)
 
-logs: ## Show daemon logs (tail -f)
+logs: ## Tail the live log file
 	@tail -f $(CONFIG_DIR)/logs/umabot.log
 
-##@ Skills Management
+ps: ## List all UmaBot processes
+	@ps aux | grep -E "umabot|python.*gateway|python.*connector" | grep -v grep \
+		|| echo "$(YELLOW)No UmaBot processes running$(NC)"
 
-skills-list: install ## List installed skills
+# ---------------------------------------------------------------------------
+# Control Panel
+# ---------------------------------------------------------------------------
+
+panel: install ## Start web control panel (installs deps, opens browser)
+	@echo "$(BLUE)Starting control panel...$(NC)"
+	@$(PIP) install --quiet -e ".[panel]"
+	@$(UMABOT) panel --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
+
+panel-build: ## Build React frontend → umabot/controlpanel/static/
+	@echo "$(BLUE)Building frontend...$(NC)"
+	@cd umabot/controlpanel/frontend && npm install && npm run build
+	@echo "$(GREEN)✓ Built → umabot/controlpanel/static/$(NC)"
+
+panel-dev: ## Start frontend HMR dev server (requires 'make run' on :8080)
+	@echo "$(BLUE)Starting HMR dev server → http://localhost:5173$(NC)"
+	@echo "$(YELLOW)Requires 'make run' running on :8080$(NC)"
+	@cd umabot/controlpanel/frontend && npm run dev
+
+# ---------------------------------------------------------------------------
+# Skills
+# ---------------------------------------------------------------------------
+
+skills: install ## List all loaded skills
 	@$(UMABOT) skills list --config $(CONFIG_FILE)
 
-skills-install: install ## Install skill (usage: make skills-install SKILL=<source>)
+skill-add: install ## Install a skill  (make skill-add SKILL=<path|url|name>)
 	@if [ -z "$(SKILL)" ]; then \
-		echo "$(RED)Error: SKILL not specified$(NC)"; \
-		echo "Usage: make skills-install SKILL=<source>"; \
-		echo "Examples:"; \
-		echo "  make skills-install SKILL=umabot-skill-github"; \
-		echo "  make skills-install SKILL=https://github.com/user/skill.git"; \
-		echo "  make skills-install SKILL=./my-skill"; \
-		exit 1; \
+		echo "$(RED)Usage: make skill-add SKILL=<path|url|name>$(NC)"; exit 1; \
 	fi
 	@$(UMABOT) skills install $(SKILL) --config $(CONFIG_FILE)
+	@echo "$(YELLOW)Run 'make reload' to activate$(NC)"
 
-skills-remove: install ## Remove skill (usage: make skills-remove SKILL=<name>)
+skill-rm: install ## Remove a skill  (make skill-rm SKILL=<name>)
 	@if [ -z "$(SKILL)" ]; then \
-		echo "$(RED)Error: SKILL not specified$(NC)"; \
-		echo "Usage: make skills-remove SKILL=<name>"; \
-		exit 1; \
+		echo "$(RED)Usage: make skill-rm SKILL=<name>$(NC)"; exit 1; \
 	fi
 	@$(UMABOT) skills remove $(SKILL) --config $(CONFIG_FILE)
+	@echo "$(YELLOW)Run 'make reload' to deactivate$(NC)"
 
-skills-lint: install ## Validate all skills
-	@$(UMABOT) skills lint --config $(CONFIG_FILE)
+# ---------------------------------------------------------------------------
+# Config & DB
+# ---------------------------------------------------------------------------
 
-##@ Development
+config: ## Print current config.yaml
+	@cat $(CONFIG_FILE) 2>/dev/null || echo "$(YELLOW)No config found — run 'make init' first$(NC)"
 
-test: ## Run tests
+edit: ## Open config.yaml in $$EDITOR (falls back to nano)
+	@[ -f $(CONFIG_FILE) ] || { echo "$(YELLOW)No config — run 'make init' first$(NC)"; exit 1; }
+	@$${EDITOR:-nano} $(CONFIG_FILE)
+
+db: ## Open SQLite shell
+	@sqlite3 $(CONFIG_DIR)/umabot.db
+
+db-backup: ## Backup database to ~/.umabot/backups/
+	@mkdir -p $(CONFIG_DIR)/backups
+	@cp $(CONFIG_DIR)/umabot.db $(CONFIG_DIR)/backups/umabot-$(shell date +%Y%m%d-%H%M%S).db
+	@echo "$(GREEN)✓ Backed up$(NC)"
+
+db-reset: stop ## Delete database — keep config (WARNING: loses all history)
+	@echo "$(RED)WARNING: Deletes all messages, tasks, and history$(NC)"
+	@read -p "Are you sure? (yes/no): " c; [ "$$c" = "yes" ] || { echo "Cancelled"; exit 0; }
+	@rm -f $(CONFIG_DIR)/umabot.db $(CONFIG_DIR)/umabot.db-shm $(CONFIG_DIR)/umabot.db-wal
+	@echo "$(GREEN)✓ Database cleared — restart UmaBot to recreate$(NC)"
+
+# ---------------------------------------------------------------------------
+# Development
+# ---------------------------------------------------------------------------
+
+test: ## Run pytest
 	@echo "$(YELLOW)Running tests...$(NC)"
-	@$(BIN)/pytest tests/ -v || echo "$(YELLOW)No tests found$(NC)"
+	@$(BIN)/pytest tests/ -v 2>/dev/null || echo "$(YELLOW)No tests found$(NC)"
 
-lint: ## Run linters (flake8, mypy)
-	@echo "$(YELLOW)Running linters...$(NC)"
+lint: ## Run flake8 + mypy
+	@echo "$(YELLOW)Linting...$(NC)"
 	@$(BIN)/flake8 umabot/ || true
 	@$(BIN)/mypy umabot/ || true
 
 format: ## Format code with black
-	@echo "$(YELLOW)Formatting code...$(NC)"
 	@$(BIN)/black umabot/
-	@echo "$(GREEN)✓ Code formatted!$(NC)"
+	@echo "$(GREEN)✓ Formatted$(NC)"
 
-check: lint test ## Run all checks (lint + test)
+check: lint test ## Run lint + test
 
-##@ Cleanup
+shell: install ## Open Python REPL with umabot imported
+	@$(BIN)/python -i -c "from umabot import *; print('UmaBot loaded')"
 
-clean: ## Clean build artifacts and cache
-	@echo "$(YELLOW)Cleaning build artifacts...$(NC)"
-	@rm -rf build/
-	@rm -rf dist/
-	@rm -rf *.egg-info
+gateway: install ## Start gateway only — no connectors (dev/debug)
+	@echo "$(BLUE)Starting gateway only...$(NC)"
+	@$(BIN)/python -m umabot.gateway --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+reset: stop ## Wipe ~/.umabot/ + sessions, keep .venv  →  re-run 'make init'
+	@echo "$(RED)Deletes: ~/.umabot/ (config, db, vault, logs) and *.session files$(NC)"
+	@read -p "Are you sure? (yes/no): " c; [ "$$c" = "yes" ] || { echo "Cancelled"; exit 0; }
+	@rm -rf $(CONFIG_DIR)
+	@find . -maxdepth 2 -name "*.session" -delete 2>/dev/null || true
+	@echo "$(GREEN)✓ Reset. Run 'make init' to configure from scratch.$(NC)"
+
+clean: stop ## Nuke everything: .venv + ~/.umabot/ + sessions + build artifacts
+	@echo "$(RED)Deletes: .venv, ~/.umabot/, *.session, build artifacts$(NC)"
+	@read -p "Are you sure? (yes/no): " c; [ "$$c" = "yes" ] || { echo "Cancelled"; exit 0; }
+	@rm -rf build/ dist/ *.egg-info $(VENV) $(CONFIG_DIR)
 	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	@find . -type f -name "*.pyc" -delete
-	@find . -type f -name "*.pyo" -delete
-	@echo "$(GREEN)✓ Clean complete!$(NC)"
+	@find . \( -name "*.pyc" -o -name "*.pyo" -o -name "*.session" \) -delete 2>/dev/null || true
+	@echo "$(GREEN)✓ Clean slate. Run 'make install && make init' to start fresh.$(NC)"
 
-clean-all: clean stop ## Clean everything including venv and data
-	@echo "$(RED)WARNING: This will delete the virtual environment and all data!$(NC)"
-	@read -p "Are you sure? (yes/no): " confirm; \
-	if [ "$$confirm" = "yes" ]; then \
-		echo "$(YELLOW)Removing virtual environment...$(NC)"; \
-		rm -rf $(VENV); \
-		echo "$(YELLOW)Removing data directory...$(NC)"; \
-		rm -rf $(CONFIG_DIR); \
-		echo "$(GREEN)✓ Complete cleanup done!$(NC)"; \
-	else \
-		echo "$(BLUE)Cleanup cancelled$(NC)"; \
-	fi
+# ---------------------------------------------------------------------------
+# Release
+# ---------------------------------------------------------------------------
 
-##@ Build & Release
-
-build: clean ## Build distribution packages
-	@echo "$(BLUE)Building distribution packages...$(NC)"
+build: ## Build distribution packages (wheel + sdist)
+	@echo "$(BLUE)Building...$(NC)"
 	@$(BIN)/python -m build
-	@echo "$(GREEN)✓ Build complete! Check dist/$(NC)"
+	@echo "$(GREEN)✓ Built → dist/$(NC)"
 
-publish-test: build ## Publish to TestPyPI
-	@echo "$(YELLOW)Publishing to TestPyPI...$(NC)"
+publish-test: build ## Upload to TestPyPI
 	@$(BIN)/twine upload --repository testpypi dist/*
 
-publish: build ## Publish to PyPI
-	@echo "$(RED)Publishing to PyPI...$(NC)"
-	@read -p "Are you sure? (yes/no): " confirm; \
-	if [ "$$confirm" = "yes" ]; then \
-		$(BIN)/twine upload dist/*; \
-		echo "$(GREEN)✓ Published to PyPI!$(NC)"; \
-	else \
-		echo "$(BLUE)Publish cancelled$(NC)"; \
-	fi
+publish: build ## Upload to PyPI
+	@echo "$(RED)Publishing to PyPI$(NC)"
+	@read -p "Are you sure? (yes/no): " c; [ "$$c" = "yes" ] || { echo "Cancelled"; exit 0; }
+	@$(BIN)/twine upload dist/*
+	@echo "$(GREEN)✓ Published$(NC)"
 
-##@ Database
+# ---------------------------------------------------------------------------
+# Info
+# ---------------------------------------------------------------------------
 
-db-shell: ## Open SQLite shell for database
-	@sqlite3 $(CONFIG_DIR)/umabot.db
-
-db-backup: ## Backup database
-	@mkdir -p $(CONFIG_DIR)/backups
-	@cp $(CONFIG_DIR)/umabot.db $(CONFIG_DIR)/backups/umabot-$(shell date +%Y%m%d-%H%M%S).db
-	@echo "$(GREEN)✓ Database backed up!$(NC)"
-
-db-reset: stop ## Reset database (WARNING: deletes all data)
-	@echo "$(RED)WARNING: This will delete all messages, tasks, and history!$(NC)"
-	@read -p "Are you sure? (yes/no): " confirm; \
-	if [ "$$confirm" = "yes" ]; then \
-		rm -f $(CONFIG_DIR)/umabot.db; \
-		echo "$(GREEN)✓ Database reset!$(NC)"; \
-		echo "$(YELLOW)Restart UmaBot to create a new database$(NC)"; \
-	else \
-		echo "$(BLUE)Reset cancelled$(NC)"; \
-	fi
-
-##@ Utilities
-
-shell: install ## Open Python shell with UmaBot imported
-	@echo "$(BLUE)Opening Python shell...$(NC)"
-	@$(BIN)/python -i -c "from umabot import *; print('UmaBot modules loaded')"
-
-config-show: ## Show current configuration
-	@cat $(CONFIG_FILE) || echo "$(YELLOW)No configuration found. Run 'make init' first.$(NC)"
-
-config-edit: ## Edit configuration file
-	@if [ ! -f $(CONFIG_FILE) ]; then \
-		echo "$(YELLOW)No configuration found. Run 'make init' first.$(NC)"; \
-		exit 1; \
-	fi
-	@$${EDITOR:-nano} $(CONFIG_FILE)
-
-watch-logs: logs ## Watch logs in real-time (alias for logs)
-
-ps: ## Show UmaBot processes
-	@ps aux | grep -E "umabot|python.*gateway|python.*connector" | grep -v grep || echo "$(YELLOW)No UmaBot processes running$(NC)"
-
-##@ Quick Start Workflows
-
-quick-start: install init start ## Complete setup and start (interactive)
+info: ## Show system paths and state
+	@echo "$(BLUE)UmaBot Info$(NC)"
+	@echo "  Python    : $(shell $(PYTHON) --version)"
+	@echo "  Venv      : $(VENV)"
+	@echo "  Config    : $(CONFIG_FILE)"
+	@echo "  Database  : $(CONFIG_DIR)/umabot.db"
+	@echo "  Logs      : $(CONFIG_DIR)/logs/"
+	@echo "  Log level : $(LOG_LEVEL)"
 	@echo ""
-	@echo "$(GREEN)✓ UmaBot is running!$(NC)"
-	@echo ""
-	@echo "Useful commands:"
-	@echo "  make status   # Check if running"
-	@echo "  make logs     # View logs"
-	@echo "  make stop     # Stop daemon"
-
-demo: install ## Quick demo setup (development)
-	@echo "$(BLUE)Setting up demo environment...$(NC)"
-	@cp config.example.yaml config.yaml || true
-	@$(MAKE) run-debug
-
-##@ Info
-
-version: ## Show UmaBot version
-	@$(UMABOT) --version || echo "UmaBot (development)"
-
-info: ## Show system information
-	@echo "$(BLUE)UmaBot System Information$(NC)"
-	@echo ""
-	@echo "Python:     $(shell $(PYTHON) --version)"
-	@echo "Virtualenv: $(VENV)"
-	@echo "Config:     $(CONFIG_FILE)"
-	@echo "Database:   $(CONFIG_DIR)/umabot.db"
-	@echo "Logs:       $(CONFIG_DIR)/logs/"
-	@echo "Skills:     $(CONFIG_DIR)/skills/"
-	@echo "Log Level:  $(LOG_LEVEL)"
-	@echo ""
-	@if [ -f $(CONFIG_DIR)/umabot.db ]; then \
-		echo "$(GREEN)✓ Database exists$(NC)"; \
-	else \
-		echo "$(YELLOW)! Database not created yet$(NC)"; \
-	fi
-	@if [ -f $(CONFIG_FILE) ]; then \
-		echo "$(GREEN)✓ Configuration exists$(NC)"; \
-	else \
-		echo "$(YELLOW)! No configuration found$(NC)"; \
-	fi
+	@[ -f $(CONFIG_FILE) ]         && echo "$(GREEN)  ✓ Config exists$(NC)"   || echo "$(YELLOW)  ! No config$(NC)"
+	@[ -f $(CONFIG_DIR)/umabot.db ] && echo "$(GREEN)  ✓ Database exists$(NC)" || echo "$(YELLOW)  ! No database$(NC)"
+	@[ -d $(VENV) ]                && echo "$(GREEN)  ✓ Venv exists$(NC)"     || echo "$(YELLOW)  ! No venv$(NC)"
 
 .DEFAULT_GOAL := help

@@ -229,3 +229,7 @@ package-lock.json
 
 # Claude Code local settings
 .claude/
+
+# Project-specific: keep out of version control
+CLAUDE.md
+.github/

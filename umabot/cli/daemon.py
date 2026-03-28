@@ -202,5 +202,5 @@ def show_daemon_status(config_path: Optional[str]) -> None:
         port = getattr(cfg.control_panel, "web_port", 8080)
         console.print(
             f"[yellow]● Control panel configured but not running → "
-            f"[cyan]umabot panel[/cyan] or [cyan]umabot start[/cyan][/yellow]"
+            f"[cyan]make panel[/cyan] or [cyan]make start[/cyan][/yellow]"
         )

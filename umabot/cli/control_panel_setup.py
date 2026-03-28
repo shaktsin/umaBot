@@ -193,7 +193,7 @@ async def setup_telegram_control_panel(config_path: Optional[str] = None) -> boo
         f"  • Chat ID: {chat_id}\n"
         f"  • Connector: {connector_name}\n\n"
         "[cyan]Next steps:[/cyan]\n"
-        f"  1. Start UmaBot: [bold]umabot start[/bold]\n"
+        f"  1. Start UmaBot: [bold]make start[/bold]\n"
         f"  2. The bot will use this chat for confirmations\n"
         f"  3. Test it by triggering a 🔴 RED tool (like shell.run)",
         border_style="green"

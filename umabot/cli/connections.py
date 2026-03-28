@@ -34,7 +34,7 @@ def show_status(config_path: Optional[str] = None, live: bool = False) -> None:
     db_path = Path(cfg.storage.db_path)
     if not db_path.exists():
         console.print("[yellow]Database not found. Start the daemon first with:[/yellow]")
-        console.print("  [cyan]umabot start[/cyan]")
+        console.print("  [cyan]make start[/cyan]")
         return
 
     db = Database(cfg.storage.db_path)
