@@ -61,11 +61,33 @@ class PolicyEngine:
             return PolicyDecision(False, False, reason=f"Invalid args: {exc.message}")
 
         if tool.risk_level == RISK_RED:
-            token = self._create_confirmation(
-                chat_id, channel, connector, session_id, message_id, tool_call, messages
+            return self.request_confirmation(
+                tool_call=tool_call,
+                chat_id=chat_id,
+                channel=channel,
+                connector=connector,
+                session_id=session_id,
+                message_id=message_id,
+                messages=messages,
             )
-            return PolicyDecision(False, True, token=token)
         return PolicyDecision(True, False)
+
+    def request_confirmation(
+        self,
+        *,
+        tool_call: Dict[str, Any],
+        chat_id: str,
+        channel: str,
+        connector: str,
+        session_id: int,
+        message_id: int,
+        messages: list[dict],
+        reason: Optional[str] = None,
+    ) -> PolicyDecision:
+        token = self._create_confirmation(
+            chat_id, channel, connector, session_id, message_id, tool_call, messages
+        )
+        return PolicyDecision(False, True, reason=reason, token=token)
 
     def _create_confirmation(
         self,

@@ -14,7 +14,7 @@ import yaml
 
 from dataclasses import asdict
 
-from .schema import Config, SkillRuntimeOverride, SkillsConfig, default_config
+from .schema import Config, PolicyRuleConfig, SkillRuntimeOverride, SkillsConfig, default_config
 
 
 logger = logging.getLogger("umabot.config")
@@ -98,6 +98,8 @@ def load_config(
     if overrides:
         _apply_overrides(cfg, overrides)
 
+    _merge_policy_rules_from_file(cfg, resolved_config_path=resolved_config_path)
+
     _load_keychain_secrets(cfg)
     cfg.resolve_paths()
 
@@ -105,6 +107,67 @@ def load_config(
         resolved_config_path = _default_config_path()
 
     return cfg, str(resolved_config_path)
+
+
+def _merge_policy_rules_from_file(cfg: Config, *, resolved_config_path: Optional[Path]) -> None:
+    """Load policy.rules_file and merge it with inline policy.rules.
+
+    Merge order:
+      1) rules loaded from policy.rules_file
+      2) inline policy.rules from config.yaml
+
+    Inline rules are appended so local config can add targeted overrides while
+    keeping the bulk of ACL policy in a dedicated file.
+    """
+    policy = getattr(cfg, "policy", None)
+    if not policy:
+        return
+
+    rules_file = (getattr(policy, "rules_file", "") or "").strip()
+    if not rules_file:
+        return
+
+    inline_rules = list(getattr(policy, "rules", []) or [])
+
+    rules_path = Path(rules_file).expanduser()
+    if not rules_path.is_absolute():
+        base_dir = (
+            resolved_config_path.parent
+            if resolved_config_path is not None
+            else _default_config_path().expanduser().parent
+        )
+        rules_path = (base_dir / rules_path).resolve()
+
+    file_data = _read_yaml(rules_path)
+    if not file_data:
+        policy.rules = inline_rules
+        policy.rules_file = str(rules_path)
+        return
+
+    if isinstance(file_data, dict):
+        file_rules = file_data.get("rules", [])
+    elif isinstance(file_data, list):
+        file_rules = file_data
+    else:
+        raise ConfigError(
+            f"Invalid policy rules file format in {rules_path}: expected mapping or list"
+        )
+
+    if not isinstance(file_rules, list):
+        raise ConfigError(
+            f"Invalid policy rules file format in {rules_path}: 'rules' must be a list"
+        )
+
+    parsed_rules: list[PolicyRuleConfig] = []
+    for idx, item in enumerate(file_rules):
+        if not isinstance(item, dict):
+            raise ConfigError(
+                f"Invalid policy rule at index {idx} in {rules_path}: expected mapping"
+            )
+        parsed_rules.append(_dataclass_from_dict(PolicyRuleConfig, item))
+
+    policy.rules = parsed_rules + inline_rules
+    policy.rules_file = str(rules_path)
 
 
 def save_config(cfg: Config, path: str) -> None:

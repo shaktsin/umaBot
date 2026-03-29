@@ -28,6 +28,7 @@ import asyncio
 import email
 import email.header
 import logging
+import re
 import sys
 import aiohttp
 
@@ -62,6 +63,17 @@ def _decode_header_value(raw: str) -> str:
 
 
 _MAX_BODY_CHARS = 4000   # truncate very long emails before sending to LLM
+_HEADER_PREFIXES = (
+    b"Delivered-To:",
+    b"Return-Path:",
+    b"From:",
+    b"To:",
+    b"Date:",
+    b"Subject:",
+    b"Message-ID:",
+    b"Received:",
+)
+_RE_IMAP_TAGGED_OK = re.compile(rb"^[A-Z0-9]+\s+OK\b")
 
 
 def _extract_body(msg) -> str:
@@ -97,10 +109,13 @@ def _format_email_for_llm(raw: bytes, uid: int) -> str:
     from_ = _decode_header_value(msg.get("From", "?"))
     to_ = _decode_header_value(msg.get("To", "?"))
     date = msg.get("Date", "?")
+    rfc_message_id = _decode_header_value(msg.get("Message-ID", "")) or "(missing)"
     body = _extract_body(msg)
 
     return (
-        f"[Incoming email — uid={uid}]\n"
+        f"[Incoming email — imap_uid={uid}]\n"
+        f"IMAP-UID: {uid} (IMAP only; do NOT use as gmail.read message_id)\n"
+        f"RFC-Message-ID: {rfc_message_id}\n"
         f"From:    {from_}\n"
         f"To:      {to_}\n"
         f"Date:    {date}\n"
@@ -108,8 +123,74 @@ def _format_email_for_llm(raw: bytes, uid: int) -> str:
         f"\n{body or '(no body)'}\n"
         f"\n---\n"
         f"Summarize this email and tell me if it needs my attention. "
+        f"Use only the content above. If parts are missing, provide a best-effort summary "
+        f"from available headers/body and clearly note any limitations. "
         f"If a reply is appropriate, draft one and ask me to confirm before sending."
     )
+
+
+def _extract_email_debug_fields(raw: bytes) -> tuple[str, str, int]:
+    """Return (subject, rfc_message_id, body_len, body_preview) for debug logging."""
+    try:
+        msg = email.message_from_bytes(raw)
+        subject = _decode_header_value(msg.get("Subject", "(no subject)"))
+        rfc_message_id = _decode_header_value(msg.get("Message-ID", "")) or "(missing)"
+        body = _extract_body(msg)
+        body_len = len(body)
+        body_preview = " ".join(body.split())[:200]
+        return subject, rfc_message_id, body_len, body_preview
+    except Exception:
+        return "(parse-error)", "(parse-error)", 0, ""
+
+
+def _extract_raw_rfc822_from_fetch_lines(lines) -> bytes:
+    """Reassemble the full RFC822 payload from IMAP UID FETCH response lines.
+
+    aioimaplib can split a single FETCH literal into multiple byte chunks.
+    The previous implementation returned the first chunk only, which could
+    drop most headers/body and cause "missing body" summaries.
+    """
+    # aioimaplib appends FETCH literal payload as bytearray once fully received.
+    for part in (lines or []):
+        if isinstance(part, bytearray) and part:
+            return bytes(part).strip()
+
+    byte_parts = [bytes(part) for part in (lines or []) if isinstance(part, (bytes, bytearray))]
+    if not byte_parts:
+        return b""
+
+    blob = b"".join(byte_parts)
+
+    # Fast path: standard FETCH metadata contains BODY[] {<size>}\r\n<raw>.
+    marker_pos = blob.find(b"BODY[] {")
+    if marker_pos >= 0:
+        literal_start = blob.find(b"\r\n", marker_pos)
+        if literal_start < 0:
+            literal_start = blob.find(b"\n", marker_pos)
+        if literal_start >= 0:
+            blob = blob[literal_start + 2:]
+
+    # Find the earliest plausible RFC822 header start.
+    start = 0
+    starts = [pos for prefix in _HEADER_PREFIXES for pos in (
+        blob.find(prefix),
+        blob.find(b"\r\n" + prefix),
+        blob.find(b"\n" + prefix),
+    ) if pos >= 0]
+    if starts:
+        start = min((pos + 2) if blob[pos:pos + 2] in {b"\r\n", b"\n"} else pos for pos in starts)
+        blob = blob[start:]
+
+    # Trim trailing IMAP framing/status lines.
+    lines_out = blob.splitlines(keepends=True)
+    while lines_out:
+        tail = lines_out[-1].strip()
+        if tail in {b"", b")"} or _RE_IMAP_TAGGED_OK.match(tail):
+            lines_out.pop()
+            continue
+        break
+
+    return b"".join(lines_out).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -293,12 +374,49 @@ class GmailImapConnector:
         resp = await imap.uid("fetch", str(uid), "(BODY.PEEK[])")
         if resp.result != "OK" or not resp.lines:
             return f"[Incoming email — uid={uid}]\n(could not fetch body)\nSummarize: new email arrived."
-        for part in resp.lines:
-            if isinstance(part, bytes) and len(part) > 10:
-                try:
-                    return _format_email_for_llm(part, uid)
-                except Exception:
-                    pass
+
+        raw = _extract_raw_rfc822_from_fetch_lines(resp.lines)
+        if raw:
+            try:
+                subject, rfc_message_id, body_len, body_preview = _extract_email_debug_fields(raw)
+                logger.debug(
+                    "Gmail IMAP parsed uid=%d subject=%r rfc_message_id=%r body_len=%d raw_bytes=%d body_preview=%r",
+                    uid,
+                    subject,
+                    rfc_message_id,
+                    body_len,
+                    len(raw),
+                    body_preview,
+                )
+                return _format_email_for_llm(raw, uid)
+            except Exception:
+                logger.exception("Failed to parse full RFC822 payload uid=%d", uid)
+        else:
+            logger.debug(
+                "Gmail IMAP payload extraction empty uid=%d fetch_parts=%d",
+                uid,
+                len(resp.lines or []),
+            )
+
+        # Fallback: try parsing all bytes joined together.
+        joined = b"".join(
+            bytes(part) for part in (resp.lines or []) if isinstance(part, (bytes, bytearray))
+        ).strip()
+        if joined:
+            try:
+                subject, rfc_message_id, body_len, body_preview = _extract_email_debug_fields(joined)
+                logger.debug(
+                    "Gmail IMAP joined fallback uid=%d subject=%r rfc_message_id=%r body_len=%d raw_bytes=%d body_preview=%r",
+                    uid,
+                    subject,
+                    rfc_message_id,
+                    body_len,
+                    len(joined),
+                    body_preview,
+                )
+                return _format_email_for_llm(joined, uid)
+            except Exception:
+                logger.exception("Failed joined fallback parse uid=%d", uid)
         return f"[Incoming email — uid={uid}]\n(could not parse body)\nSummarize: new email arrived."
 
     async def stop(self) -> None:

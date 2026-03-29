@@ -140,7 +140,7 @@ cat config.example.yaml
 | `skill_dirs` | Directories scanned for skills at startup |
 | `agents` | Orchestrator + worker model, iteration limits |
 | `security` | Role-based tool access, SSRF protection |
-| `policy` | Approval strictness (normal = RED only, strict = all tools) |
+| `policy` | Approval strictness + declarative ACL rules (`rules` / `rules_file`) |
 
 **Secrets** are never stored in `config.yaml`. They're kept in macOS Keychain (automatic) or read from environment variables:
 
@@ -236,6 +236,28 @@ tools:
         create_files: true
         delete_files: false   # agents cannot delete files here
         shell: true
+```
+
+### Declarative ACL Rules
+
+For connector-agnostic inbound/outbound policy, use `policy.rules` (inline) or
+`policy.rules_file` (external YAML). Rules can:
+- block or require confirmation for tools (`apply.tool`)
+- decide whether inbound listener messages are sent to LLM (`apply.ingest_to_llm`)
+- override listener intent (`apply.set_action`, `apply.set_importance`, `apply.set_needs_admin`)
+
+```yaml
+policy:
+  rules_file: ~/.umabot/policies/default.yaml
+  rules:
+    - id: gmail-search-explicit-admin
+      priority: 20
+      match:
+        tools: ["gmail.search"]
+        admin_explicit: false
+      apply:
+        tool: deny
+        reason: "gmail.search requires explicit admin request."
 ```
 
 ---

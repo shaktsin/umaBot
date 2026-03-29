@@ -64,6 +64,7 @@ async def gmail_list(args: Dict[str, Any], *, client_id, client_secret, db) -> s
 async def gmail_read(args: Dict[str, Any], *, client_id, client_secret, db) -> str:
     """Read full email body by message ID."""
     from .auth import get_credentials
+    from googleapiclient.errors import HttpError
 
     creds = get_credentials(client_id, client_secret, db)
     if not creds:
@@ -74,9 +75,19 @@ async def gmail_read(args: Dict[str, Any], *, client_id, client_secret, db) -> s
         return "message_id is required."
 
     svc = _service(creds)
-    detail = svc.users().messages().get(
-        userId="me", id=msg_id, format="full"
-    ).execute()
+    try:
+        detail = svc.users().messages().get(
+            userId="me", id=msg_id, format="full"
+        ).execute()
+    except HttpError as exc:
+        if getattr(getattr(exc, "resp", None), "status", None) == 404:
+            return (
+                f"Gmail message '{msg_id}' was not found.\n"
+                "This usually means the value is not a Gmail API message_id "
+                "(for example an IMAP UID like '67885').\n"
+                "Use gmail.search or gmail.list first, then pass the returned Gmail ID to gmail.read."
+            )
+        raise
 
     hdrs = _fmt_headers(detail.get("payload", {}).get("headers", []))
     body = _extract_body(detail.get("payload", {}))

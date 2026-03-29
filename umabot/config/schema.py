@@ -219,8 +219,67 @@ class ToolsConfig:
 
 
 @dataclass
+class PolicyRuleMatchConfig:
+    """Match conditions for a single declarative policy rule.
+
+    Every field is optional; empty values mean "match all".
+    Pattern fields support fnmatch globs, e.g. "gmail_*" or "gmail.*".
+    """
+
+    connectors: List[str] = field(default_factory=list)
+    connector_roles: List[str] = field(default_factory=list)  # listener | admin
+    channels: List[str] = field(default_factory=list)         # gmail | telegram | web | ...
+    directions: List[str] = field(default_factory=list)       # inbound | outbound
+    kinds: List[str] = field(default_factory=list)            # external | control | task_run
+    tools: List[str] = field(default_factory=list)            # gmail.read, gmail.*, shell.*
+    importance: List[str] = field(default_factory=list)       # high | medium | low
+    actions: List[str] = field(default_factory=list)          # summarize | draft_reply | create_task | ignore
+    needs_admin: Optional[bool] = None
+    admin_explicit: Optional[bool] = None
+
+
+@dataclass
+class PolicyRuleApplyConfig:
+    """Effects produced when a policy rule matches."""
+
+    # inherit | allow | deny | require_confirmation
+    tool: str = "inherit"
+    # Whether this inbound message may be sent to the main LLM pipeline.
+    ingest_to_llm: Optional[bool] = None
+    # Optional intent overrides (listener flow).
+    set_importance: str = ""
+    set_action: str = ""
+    set_needs_admin: Optional[bool] = None
+    # Human-readable reason shown in logs / denial messages.
+    reason: str = ""
+
+
+@dataclass
+class PolicyRuleConfig:
+    """Declarative policy rule definition.
+
+    Rules are evaluated by ascending ``priority`` (lower value runs first),
+    then by declaration order.
+    """
+
+    id: str = ""
+    enabled: bool = True
+    priority: int = 100
+    description: str = ""
+    match: PolicyRuleMatchConfig = field(default_factory=PolicyRuleMatchConfig)
+    apply: PolicyRuleApplyConfig = field(default_factory=PolicyRuleApplyConfig)
+
+
+@dataclass
 class PolicyConfig:
     confirmation_strictness: str = "normal"  # normal | strict
+    # Optional external file containing policy rules to keep config.yaml small.
+    # Supports either:
+    #   1) top-level "rules: [...]"
+    #   2) direct list "[...]"
+    rules_file: str = ""
+    # Inline declarative rules.
+    rules: List[PolicyRuleConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -418,6 +477,8 @@ class Config:
         self.storage.vault_dir = _expand_path(self.storage.vault_dir)
         self.runtime.pid_file = _expand_path(self.runtime.pid_file)
         self.runtime.log_dir = _expand_path(self.runtime.log_dir)
+        if self.policy.rules_file:
+            self.policy.rules_file = _expand_path(self.policy.rules_file)
         if self.agents.context_file:
             self.agents.context_file = _expand_path(self.agents.context_file)
         _resolve_skill_runtime_override(self.skills.defaults)
