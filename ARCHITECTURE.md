@@ -100,6 +100,7 @@ Reference for contributors and advanced users. Covers internals, message flow, t
 | **LLM Scheduler** | Priority queue (P0/P1/P2) + token bucket + 429 retry | Worker |
 | **Worker** | Claims jobs, runs intent detection + LLM + tool loop | Async event loop |
 | **Intent Detector** | Lightweight P2 LLM call to classify listener messages | Worker |
+| **Declarative Policy Rules** | Config-driven inbound/outbound ACLs across connectors (`policy.rules`) | Worker |
 | **Policy Engine** | Assigns risk tier, manages confirmation tokens | Worker |
 | **Unified Tool Registry** | Routes tool calls to built-ins, skills, or MCP | Worker |
 | **Task Scheduler** | Enqueues periodic and one-time tasks | Separate asyncio loop |

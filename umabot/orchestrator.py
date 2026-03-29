@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import signal
 import sys
 from typing import List, Optional
 
 from umabot.config import load_config
+
+logger = logging.getLogger("umabot.orchestrator")
 
 
 async def _run_process(cmd: List[str], name: str, *, inherit_stdin: bool = False) -> asyncio.subprocess.Process:
@@ -91,6 +94,19 @@ def _build_worker_cmds(cfg, config_path: str, log_level: Optional[str]) -> List[
             cmds.append((cmd, False))
 
         elif conn_type == "gmail_imap":
+            # Keep core gateway/control chat alive even when Gmail integration
+            # is not fully configured. Previously, a single gmail_imap process
+            # exited early and caused orchestrator shutdown for all services.
+            integrations = getattr(cfg, "integrations", None)
+            google = getattr(integrations, "google", None) if integrations else None
+            client_id = (getattr(google, "client_id", "") or "") if google else ""
+            client_secret = (getattr(google, "client_secret", "") or "") if google else ""
+            if not client_id or not client_secret:
+                logger.warning(
+                    "Skipping connector '%s' (gmail_imap): integrations.google.client_id/client_secret missing",
+                    conn_name,
+                )
+                continue
             cmd = _gmail_watch_cmd(conn_name, config_path, log_level)
             cmds.append((cmd, False))
 

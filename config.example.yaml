@@ -189,6 +189,58 @@ security:
 # ---------------------------------------------------------------------------
 policy:
   confirmation_strictness: normal  # normal (RED only) | strict (all tools)
+  # Optional external rule file (recommended for non-trivial ACL policy).
+  # Relative paths resolve from config.yaml directory.
+  rules_file: ~/.umabot/policies/default.yaml
+
+  # Inline rules (optional). Evaluated by ascending priority.
+  # Schema:
+  #   - id: unique-rule-id
+  #     enabled: true
+  #     priority: 100
+  #     match:
+  #       connectors: [gmail_imap, "telegram_*"]
+  #       connector_roles: [listener, admin]
+  #       channels: [gmail, telegram, web]
+  #       directions: [inbound, outbound]
+  #       kinds: [external, control, task_run]
+  #       tools: [gmail.search, "gmail.*", "shell.*"]
+  #       importance: [high, medium, low]
+  #       actions: [summarize, draft_reply, create_task, ignore]
+  #       needs_admin: true
+  #       admin_explicit: true
+  #     apply:
+  #       tool: inherit | allow | deny | require_confirmation
+  #       ingest_to_llm: true | false
+  #       set_importance: high | medium | low
+  #       set_action: summarize | draft_reply | create_task | ignore
+  #       set_needs_admin: true | false
+  #       reason: "human readable reason"
+  rules:
+    # Never allow implicit gmail.search calls.
+    - id: admin-gmail-search-explicit-only
+      priority: 20
+      match:
+        tools: ["gmail.search"]
+        admin_explicit: false
+      apply:
+        tool: deny
+        reason: "gmail.search must be explicitly requested by an admin."
+
+    # Inbound listener messages from gmail should always be sent to LLM
+    # and surfaced to admin as a summary at minimum.
+    - id: gmail-listener-always-ingest
+      priority: 30
+      match:
+        connectors: ["gmail*"]
+        connector_roles: ["listener"]
+        directions: ["inbound"]
+      apply:
+        ingest_to_llm: true
+        set_importance: medium
+        set_action: summarize
+        set_needs_admin: true
+        reason: "Do not silently drop inbound Gmail notifications."
 
 # ---------------------------------------------------------------------------
 # Storage

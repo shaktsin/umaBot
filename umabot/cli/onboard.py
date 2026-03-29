@@ -838,19 +838,53 @@ def _setup_gmail_watch_interactive(cfg: Config) -> None:
     mailbox = (
         questionary.text("IMAP mailbox to watch:", default="INBOX").ask() or "INBOX"
     ).strip()
+    mailbox_norm = mailbox.upper()
 
     connector_name = (
         questionary.text("Name for this connector:", default="gmail_imap").ask() or "gmail_imap"
     ).strip()
 
-    new_connector = ConnectorConfig(
-        name=connector_name,
-        type="gmail_imap",
-        mailbox=mailbox,
-    )
     if cfg.connectors is None:
         cfg.connectors = []
-    cfg.connectors.append(new_connector)
+
+    existing_by_name = next((c for c in cfg.connectors if c.name == connector_name), None)
+    if existing_by_name is not None:
+        if existing_by_name.type != "gmail_imap":
+            console.print(
+                f"[red]✗ Connector name '{connector_name}' is already used by type '{existing_by_name.type}'.[/red]\n"
+                "[dim]Choose a different connector name for Gmail IMAP.[/dim]\n"
+            )
+            return
+
+        existing_by_name.mailbox = mailbox
+        console.print(
+            f"\n[green]✓ Gmail IMAP connector '{connector_name}' already existed — updated mailbox.[/green]\n"
+            f"  Mailbox    : {mailbox}\n"
+        )
+        return
+
+    existing_same_mailbox = next(
+        (
+            c
+            for c in cfg.connectors
+            if c.type == "gmail_imap" and (getattr(c, "mailbox", "INBOX") or "INBOX").upper() == mailbox_norm
+        ),
+        None,
+    )
+    if existing_same_mailbox is not None:
+        console.print(
+            f"\n[yellow]Gmail IMAP mailbox '{mailbox}' is already configured as '{existing_same_mailbox.name}'.[/yellow]\n"
+            "[dim]Skipping duplicate connector creation.[/dim]\n"
+        )
+        return
+
+    cfg.connectors.append(
+        ConnectorConfig(
+            name=connector_name,
+            type="gmail_imap",
+            mailbox=mailbox,
+        )
+    )
 
     # Describe where notifications will land automatically
     panel_enabled = getattr(getattr(cfg, "control_panel", None), "enabled", False)

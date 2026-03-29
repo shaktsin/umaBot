@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,7 +13,7 @@ from umabot.intent import IntentResult, detect_intent, intent_context_block
 from umabot.llm import ClaudeClient, GeminiClient, OpenAIClient
 from umabot.llm.rate_limiter import TokenBucket
 from umabot.llm.scheduler import LLMScheduler, P0, P1, P2
-from umabot.policy import PolicyEngine
+from umabot.policy import DeclarativePolicyEngine, PolicyEngine, RuleContext
 from umabot.security import SecurityPolicy, mask_secrets
 from umabot.security.ssrf import check_ssrf, SSRFError
 from umabot.skills import SkillRegistry
@@ -75,6 +76,9 @@ class Worker:
         # Security policy layer
         security_cfg = getattr(config, "security", None)
         self.security_policy = SecurityPolicy(security_cfg) if security_cfg else None
+        self.declarative_policy = DeclarativePolicyEngine(
+            getattr(getattr(config, "policy", None), "rules", [])
+        )
 
         # Build separate LLM clients for the orchestration system if enabled.
         # Both inherit missing fields (provider, api_key) from the top-level llm config.
@@ -227,12 +231,68 @@ class Worker:
                     "needs_admin=%s action=%s",
                     intent.importance, intent.needs_admin, intent.suggested_action,
                 )
+                # Safety override: never silently drop inbound Gmail listener emails.
+                # LLM intent classification can occasionally misclassify real emails
+                # as low/ignore; for gmail_imap we always surface at least a summary.
+                if "gmail" in (source_connector or "").lower() and intent.should_skip:
+                    logger.info(
+                        "Overriding gmail listener intent low/ignore -> summarize source_connector=%s",
+                        source_connector,
+                    )
+                    intent.importance = "medium"
+                    intent.needs_admin = True
+                    intent.suggested_action = "summarize"
+                    if not intent.summary:
+                        intent.summary = "Inbound Gmail message received."
+                if self.declarative_policy.has_rules:
+                    intent_decision = self.declarative_policy.decide_intent(
+                        RuleContext(
+                            connector=connector,
+                            source_connector=source_connector,
+                            connector_role=connector_role,
+                            channel=channel,
+                            direction="inbound",
+                            kind=kind,
+                            action=intent.suggested_action,
+                            importance=intent.importance,
+                            needs_admin=intent.needs_admin,
+                            admin_explicit=False,
+                        )
+                    )
+                    if intent_decision.rule_id:
+                        logger.info(
+                            "Declarative policy intent rule matched id=%s reason=%s",
+                            intent_decision.rule_id,
+                            intent_decision.reason,
+                        )
+                    if intent_decision.ingest_to_llm is False:
+                        logger.info(
+                            "Dropping inbound message by declarative policy rule=%s connector=%s",
+                            intent_decision.rule_id or "-",
+                            source_connector or connector,
+                        )
+                        return
+                    if intent_decision.set_importance:
+                        intent.importance = intent_decision.set_importance
+                    if intent_decision.set_action:
+                        intent.suggested_action = intent_decision.set_action
+                    if intent_decision.set_needs_admin is not None:
+                        intent.needs_admin = intent_decision.set_needs_admin
                 if intent.should_skip:
                     logger.info(
                         "Skipping low-importance ignore message from listener connector=%s",
                         connector,
                     )
                     return
+
+            is_gmail_listener_flow = (
+                connector_role == "listener" and "gmail" in (source_connector or "").lower()
+            )
+            explicit_admin_gmail_search = _is_explicit_admin_gmail_search_request(
+                text=text,
+                connector_role=connector_role,
+                kind=kind,
+            )
 
             # Listener messages are processed as one-shot prompts — no session
             # history is loaded.  Raw emails / channel messages are never stored
@@ -248,9 +308,12 @@ class Worker:
             # Build system messages: skill catalog + active skill instructions.
             # Also set the active skill's resolved env so shell.run and run_script
             # use the correct PATH / venv for this job.
-            system_messages = _build_skill_system_messages(self.skill_registry, user_text=text)
-            if system_messages:
-                messages = system_messages + messages
+            # Gmail listener summarize flow should work only from inbound payload.
+            # Avoid skill-trigger amplification that may encourage follow-up Gmail API calls.
+            if not is_gmail_listener_flow:
+                system_messages = _build_skill_system_messages(self.skill_registry, user_text=text)
+                if system_messages:
+                    messages = system_messages + messages
 
             # Prepend intent context so the agent knows what action is expected
             # without re-reading the full message body.  Source connector/chat_id
@@ -266,9 +329,23 @@ class Worker:
                         ),
                     }
                 ] + messages
-            matched_skill = self.skill_registry.match_trigger(text)
-            if matched_skill and matched_skill.resolved_runtime:
-                set_active_skill_env(matched_skill.resolved_runtime.env)
+            if is_gmail_listener_flow:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "This is an inbound gmail_imap listener event.\n"
+                            "You must summarize strictly from the provided email payload.\n"
+                            "Do not ask the admin to paste raw email, message IDs, or run Gmail API fetches.\n"
+                            "If payload is incomplete, say what fields are available and provide best-effort summary."
+                        ),
+                    }
+                ] + messages
+            matched_skill = None
+            if not is_gmail_listener_flow:
+                matched_skill = self.skill_registry.match_trigger(text)
+                if matched_skill and matched_skill.resolved_runtime:
+                    set_active_skill_env(matched_skill.resolved_runtime.env)
 
             # Resolve active workspace: detect from user message, else default
             configured_workspaces = getattr(
@@ -279,10 +356,45 @@ class Worker:
             set_active_workspace(active_ws)
 
             allowed_tools = self._allowed_tools()
+            agents_cfg = getattr(self.config, "agents", None)
+            using_orchestrator = bool(agents_cfg and agents_cfg.enabled and self.orchestrator_llm)
+
+            # Listener-origin Gmail summaries must not trigger additional Gmail API fetches.
+            # The inbound IMAP payload already contains the email body/headers needed to summarize.
+            if is_gmail_listener_flow:
+                if allowed_tools:
+                    logger.info(
+                        "Using tool-free mode for listener summarize flow source_connector=%s",
+                        source_connector,
+                    )
+                allowed_tools = []
+
+            # gmail.search should only be available when explicitly requested by an admin user.
+            if "gmail.search" in allowed_tools and not explicit_admin_gmail_search:
+                allowed_tools = [name for name in allowed_tools if name != "gmail.search"]
+                logger.debug(
+                    "gmail.search removed from allowed tools (requires explicit admin request)"
+                )
+            if self.declarative_policy.has_rules:
+                allowed_tools = self.declarative_policy.filter_tools_for_context(
+                    allowed_tools,
+                    RuleContext(
+                        connector=connector,
+                        source_connector=source_connector,
+                        connector_role=connector_role,
+                        channel=channel,
+                        direction="outbound",
+                        kind=kind,
+                        action=(intent.suggested_action if intent else ""),
+                        importance=(intent.importance if intent else ""),
+                        needs_admin=(intent.needs_admin if intent else None),
+                        admin_explicit=explicit_admin_gmail_search,
+                    ),
+                    drop_confirm_required=using_orchestrator,
+                )
 
             # Route through the dynamic orchestrator when it's enabled
-            agents_cfg = getattr(self.config, "agents", None)
-            if agents_cfg and agents_cfg.enabled and self.orchestrator_llm:
+            if using_orchestrator and not is_gmail_listener_flow:
                 logger.info(
                     "Routing to DynamicOrchestrator kind=%s session_id=%s",
                     kind, session_id,
@@ -332,6 +444,11 @@ class Worker:
                     self.db.add_message(session_id, "assistant", final_reply)
                     await self._notify(channel, chat_id, final_reply, connector, connector_role=connector_role)
                 return
+            if using_orchestrator and is_gmail_listener_flow:
+                logger.info(
+                    "Bypassing DynamicOrchestrator for gmail listener summarize flow source_connector=%s",
+                    source_connector,
+                )
 
             tools_spec = _build_tool_specs(self.tool_registry, allowed_tools)
 
@@ -368,6 +485,109 @@ class Worker:
             for tool_call in response.tool_calls:
                 arg_count = len(tool_call.arguments) if isinstance(tool_call.arguments, dict) else 0
                 logger.debug("Tool call requested name=%s arg_count=%s", tool_call.name, arg_count)
+
+                # Hard policy guardrails in case a downstream path attempts these tools.
+                if tool_call.name == "gmail.search" and not explicit_admin_gmail_search:
+                    logger.info("Blocked gmail.search: explicit admin request required")
+                    await self._notify(
+                        channel,
+                        chat_id,
+                        "Tool denied: `gmail.search` is only allowed when explicitly requested by an admin user.",
+                        connector,
+                        connector_role=connector_role,
+                    )
+                    return
+                if tool_call.name == "gmail.read" and is_gmail_listener_flow:
+                    logger.info(
+                        "Blocked gmail.read for listener summarize flow source_connector=%s",
+                        source_connector,
+                    )
+                    await self._notify(
+                        channel,
+                        chat_id,
+                        "Tool denied: `gmail.read` is disabled for inbound gmail_imap summarize flow.",
+                        connector,
+                        connector_role=connector_role,
+                    )
+                    return
+                if is_gmail_listener_flow and (
+                    tool_call.name.startswith("gmail.") or tool_call.name == "google.authorize"
+                ):
+                    logger.info(
+                        "Blocked %s for listener summarize flow source_connector=%s",
+                        tool_call.name,
+                        source_connector,
+                    )
+                    await self._notify(
+                        channel,
+                        chat_id,
+                        f"Tool denied: `{tool_call.name}` is disabled for inbound gmail_imap summarize flow.",
+                        connector,
+                        connector_role=connector_role,
+                    )
+                    return
+
+                if self.declarative_policy.has_rules:
+                    tool_decision = self.declarative_policy.decide_tool(
+                        tool_call.name,
+                        RuleContext(
+                            connector=connector,
+                            source_connector=source_connector,
+                            connector_role=connector_role,
+                            channel=channel,
+                            direction="outbound",
+                            kind=kind,
+                            action=(intent.suggested_action if intent else ""),
+                            importance=(intent.importance if intent else ""),
+                            needs_admin=(intent.needs_admin if intent else None),
+                            admin_explicit=explicit_admin_gmail_search,
+                        ),
+                    )
+                    if tool_decision.effect == "deny":
+                        reason = tool_decision.reason or "blocked by declarative policy"
+                        logger.info(
+                            "Declarative policy denied tool=%s rule=%s reason=%s",
+                            tool_call.name,
+                            tool_decision.rule_id,
+                            reason,
+                        )
+                        await self._notify(
+                            channel,
+                            chat_id,
+                            f"Tool denied by policy: {reason}",
+                            connector,
+                            connector_role=connector_role,
+                        )
+                        return
+                    if tool_decision.effect == "require_confirmation":
+                        decision = self.policy.request_confirmation(
+                            tool_call={
+                                "name": tool_call.name,
+                                "arguments": tool_call.arguments,
+                                "id": tool_call.id,
+                            },
+                            chat_id=chat_id,
+                            channel=channel,
+                            connector=connector,
+                            session_id=session_id,
+                            message_id=assistant_message_id,
+                            messages=messages,
+                            reason=tool_decision.reason or "confirmation required by declarative policy",
+                        )
+                        logger.info(
+                            "Declarative policy requires confirmation tool=%s rule=%s",
+                            tool_call.name,
+                            tool_decision.rule_id,
+                        )
+                        await self._request_tool_confirmation(
+                            channel=channel,
+                            chat_id=chat_id,
+                            connector=connector,
+                            tool_call_name=tool_call.name,
+                            tool_call_arguments=tool_call.arguments,
+                            token=decision.token or "",
+                        )
+                        return
 
                 # Security layer: evaluate before risk-level policy
                 if self.security_policy:
@@ -418,27 +638,13 @@ class Worker:
                 )
                 if decision.require_confirmation:
                     logger.info("Tool confirmation required name=%s", tool_call.name)
-                    args_preview = json.dumps(tool_call.arguments, indent=2)[:400] if tool_call.arguments else ""
-                    if self.send_confirmation_request:
-                        # Connector-native buttons (e.g. Telegram inline keyboard)
-                        await self.send_confirmation_request(
-                            channel, chat_id, connector,
-                            tool_call.name, args_preview, decision.token,
-                        )
-                    else:
-                        # Plain-text fallback — plain YES works via most-recent pending
-                        prompt = (
-                            f"⚠️ Approval required: `{tool_call.name}`\n"
-                            f"Arguments:\n{args_preview}\n\n"
-                            f"Reply YES to approve or NO to deny."
-                        )
-                        await self.send_control_message(channel, chat_id, prompt)
-                    self.db.add_audit(
-                        "tool_confirmation_requested",
-                        {"tool": tool_call.name, "token": decision.token},
+                    await self._request_tool_confirmation(
+                        channel=channel,
                         chat_id=chat_id,
                         connector=connector,
-                        decision="pending_approval",
+                        tool_call_name=tool_call.name,
+                        tool_call_arguments=tool_call.arguments,
+                        token=decision.token or "",
                     )
                     return
                 if not decision.allowed:
@@ -578,6 +784,22 @@ class Worker:
             set_active_skill_env(matched_skill.resolved_runtime.env)
 
         allowed_tools = self._allowed_tools()
+        if self.declarative_policy.has_rules:
+            allowed_tools = self.declarative_policy.filter_tools_for_context(
+                allowed_tools,
+                RuleContext(
+                    connector="scheduler",
+                    source_connector="scheduler",
+                    connector_role="admin",
+                    channel="system",
+                    direction="outbound",
+                    kind="task_run",
+                    action="",
+                    importance="",
+                    needs_admin=True,
+                    admin_explicit=True,
+                ),
+            )
         tools_spec = _build_tool_specs(self.tool_registry, allowed_tools)
         logger.debug(
             "Task run LLM request task_id=%s run_id=%s messages=%s tools=%s ctx_rev=%s",
@@ -595,6 +817,39 @@ class Worker:
             if response.tool_calls:
                 tool_results = []
                 for tool_call in response.tool_calls:
+                    if self.declarative_policy.has_rules:
+                        tool_decision = self.declarative_policy.decide_tool(
+                            tool_call.name,
+                            RuleContext(
+                                connector="scheduler",
+                                source_connector="scheduler",
+                                connector_role="admin",
+                                channel="system",
+                                direction="outbound",
+                                kind="task_run",
+                                action="",
+                                importance="",
+                                needs_admin=True,
+                                admin_explicit=True,
+                            ),
+                        )
+                        if tool_decision.effect == "deny":
+                            text = (
+                                f"Task #{task_id} denied tool '{tool_call.name}' by policy"
+                                + (f": {tool_decision.reason}" if tool_decision.reason else ".")
+                            )
+                            self.db.fail_task_run(run_id=run_id, task_id=task_id, error=text)
+                            await self.send_control_message("system", chat_id, text)
+                            return
+                        if tool_decision.effect == "require_confirmation":
+                            text = (
+                                f"Task #{task_id} requires confirmation for tool '{tool_call.name}' "
+                                "(declarative policy). Skipping run."
+                            )
+                            self.db.fail_task_run(run_id=run_id, task_id=task_id, error=text)
+                            await self.send_control_message("system", chat_id, text)
+                            return
+
                     decision = self.policy.evaluate(
                         {"name": tool_call.name, "arguments": tool_call.arguments},
                         allowed_tools,
@@ -786,6 +1041,41 @@ class Worker:
         )
         return True
 
+    async def _request_tool_confirmation(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        connector: str,
+        tool_call_name: str,
+        tool_call_arguments: Dict[str, Any],
+        token: str,
+    ) -> None:
+        args_preview = json.dumps(tool_call_arguments, indent=2)[:400] if tool_call_arguments else ""
+        if self.send_confirmation_request:
+            await self.send_confirmation_request(
+                channel,
+                chat_id,
+                connector,
+                tool_call_name,
+                args_preview,
+                token,
+            )
+        else:
+            prompt = (
+                f"⚠️ Approval required: `{tool_call_name}`\n"
+                f"Arguments:\n{args_preview}\n\n"
+                f"Reply YES to approve or NO to deny."
+            )
+            await self.send_control_message(channel, chat_id, prompt)
+        self.db.add_audit(
+            "tool_confirmation_requested",
+            {"tool": tool_call_name, "token": token},
+            chat_id=chat_id,
+            connector=connector,
+            decision="pending_approval",
+        )
+
     def _allowed_tools(self) -> list[str]:
         if self.policy.strictness == "strict":
             return []
@@ -814,6 +1104,32 @@ def _build_agent_llm_client(config, agent_model_cfg, rate_limiter=None):
     if provider == "gemini":
         return GeminiClient(api_key, model, rate_limiter=rate_limiter)
     raise RuntimeError(f"Unknown LLM provider for agent: {provider}")
+
+
+_RE_GMAIL_SEARCH_PHRASE = re.compile(r"\bsearch\b.*\bgmail\b|\bgmail\b.*\bsearch\b")
+
+
+def _is_explicit_admin_gmail_search_request(
+    *,
+    text: str,
+    connector_role: str,
+    kind: str,
+) -> bool:
+    """True when admin explicitly asks to run Gmail search.
+
+    "Explicit" means either:
+      - direct tool mention: gmail.search
+      - clear natural-language phrase containing both "search" and "gmail"
+    """
+    if connector_role != "admin":
+        return False
+    # Guard against system-generated listener tasks being treated as explicit.
+    if kind not in {"control", "external"}:
+        return False
+    lower = (text or "").lower()
+    if "gmail.search" in lower:
+        return True
+    return bool(_RE_GMAIL_SEARCH_PHRASE.search(lower))
 
 
 def _load_agent_context(context_file: str) -> str:
@@ -993,7 +1309,8 @@ def _build_skill_system_messages(
         logger.debug("No skills loaded in registry")
         return []
 
-    logger.debug("Skill catalog: %d skills loaded", len(skills))
+    if user_text:
+        logger.debug("Skill catalog: %d skills loaded", len(skills))
     messages: List[Dict[str, str]] = []
 
     # Stage 1 — skill catalog, always present
