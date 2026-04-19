@@ -4,7 +4,7 @@ A self-hosted personal AI assistant you control through chat — Telegram, Disco
 
 Tell it to manage your calendar, run scripts, browse the web, or handle anything you'd otherwise do manually. It asks for your approval before doing anything risky, and you can extend it with skills.
 
-![Demo](https://private-user-images.githubusercontent.com/8604876/580382783-5285c86a-0abc-42fc-8dbf-41ee6d97d587.mp4?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NzY1NjI2NjQsIm5iZiI6MTc3NjU2MjM2NCwicGF0aCI6Ii84NjA0ODc2LzU4MDM4Mjc4My01Mjg1Yzg2YS0wYWJjLTQyZmMtOGRiZi00MWVlNmQ5N2Q1ODcubXA0P1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDQxOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjA0MTlUMDEzMjQ0WiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9Y2I5N2U3ZmI3ZTMyZjg5YjIyYzVhMjJmODg5ZjkwODkzMWI1MmE3MWEwNjMyY2Q5NTM3Nzc4ZDdlMzM0MzBkYyZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QmcmVzcG9uc2UtY29udGVudC10eXBlPXZpZGVvJTJGbXA0In0.WsjHFrpBXi7F1vw2wqDoo7jR8Fb81gqsbDKSZolXOP8)
+![Demo](https://private-user-images.githubusercontent.com/8604876/580382783-5285c86a-0abc-42fc-8dbf-41ee6d97d587.mp4)
 
 ---
 
