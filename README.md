@@ -6,8 +6,8 @@ Tell it to manage your calendar, run scripts, browse the web, or handle anything
 
 ## Demo
 
-- [![UmaBot demo preview](media/umabot-demo-preview.png)](https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4)
-- Demo video direct link: [umaBot.mp4](https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4)
+- Demo video: [umaBot.mp4](https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4)
+- Note: GitHub README may not render inline video players consistently, so use the direct link above.
 
 ---
 
