@@ -6,11 +6,11 @@ Tell it to manage your calendar, run scripts, browse the web, or handle anything
 
 ## Demo
 
-Demo media links were removed because they used expiring signed `private-user-images` URLs.
-
-- Demo video: [umaBot.mp4](https://github.com/shaktsin/umabot/releases/download/demo-v2/umaBot.mp4)
-- Recommended stable asset format:
-  `https://github.com/shaktsin/umabot/releases/download/<tag>/umabot-demo.mp4`
+- <video controls width="100%" src="https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4">
+  Your browser does not support the video tag.
+  </video>
+- If the player does not render on your client, use the direct link:
+  [umaBot.mp4](https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4)
 
 ---
 
