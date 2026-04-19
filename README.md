@@ -8,7 +8,7 @@ Tell it to manage your calendar, run scripts, browse the web, or handle anything
 
 Demo media links were removed because they used expiring signed `private-user-images` URLs.
 
-- Demo video: [umaBot.mp4](https://github.com/shaktsin/umabot/releases/download/demo-v2/umaBot.mp4)
+- [![UmaBot demo preview](media/umabot-demo-preview.png)](https://github.com/shaktsin/umabot/releases/download/demo-v2/umaBot.mp4)
 - Recommended stable asset format:
   `https://github.com/shaktsin/umabot/releases/download/<tag>/umabot-demo.mp4`
 
