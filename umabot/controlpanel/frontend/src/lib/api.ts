@@ -1,4 +1,5 @@
 import type {
+  Attachment,
   AuditEntry,
   Connector,
   PendingConfirmation,
@@ -64,6 +65,8 @@ export const api = {
 
   // Chat
   getChatHistory: () => fetchJson('/api/chat/history'),
+  getChatAttachment: (path: string) =>
+    fetchJson<Attachment>(`/api/chat/attachment?path=${encodeURIComponent(path)}`),
 };
 
 export function timeAgo(value: string | number): string {

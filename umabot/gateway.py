@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import logging
 import os
 import signal
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from umabot.config import load_config, parse_override_args
 from umabot.config.schema import get_connector_role
@@ -18,7 +19,16 @@ from umabot.router import ControlConfig, MessageRouter
 from umabot.scheduler import TaskScheduler
 from umabot.skills import SkillRegistry, SkillRuntimeProvisioner
 from umabot.storage import Database, Queue
-from umabot.tools import ToolRegistry, UnifiedToolRegistry, register_builtin_tools, register_google_tools
+from umabot.tools import (
+    Attachment,
+    Tool,
+    ToolRegistry,
+    ToolResult,
+    UnifiedToolRegistry,
+    register_builtin_tools,
+    register_google_tools,
+)
+from umabot.tools.mcp_registry import MCPRegistry
 from umabot.worker import Worker
 from umabot.ws import ChannelHub, WebsocketGateway
 
@@ -48,6 +58,7 @@ class Gateway:
         self.policy = policy
         self.skill_registry = skill_registry
         self.unified_registry = unified_registry
+        self._mcp_registry = MCPRegistry(getattr(config, "mcp_servers", []) or [])
 
         # Control panel manager (new architecture)
         self._control_panel = ControlPanelManager(config.control_panel, self)
@@ -84,6 +95,9 @@ class Gateway:
 
     async def start(self) -> None:
         await self._start_ws_gateway()
+        await self._mcp_registry.start()
+        self.unified_registry.set_mcp_registry(self._mcp_registry)
+        _register_mcp_tools(self.tool_registry, self.unified_registry, self._mcp_registry)
         await self._worker.start()
         await self._scheduler.start()
         logger.info("Gateway started")
@@ -91,6 +105,7 @@ class Gateway:
     async def stop(self) -> None:
         await self._scheduler.stop()
         await self._worker.stop()
+        await self._mcp_registry.stop()
         await self._stop_ws_gateway()
         logger.info("Gateway stopped")
 
@@ -105,6 +120,12 @@ class Gateway:
         self.policy = policy
         self.skill_registry = skill_registry
         self.unified_registry = unified_registry
+
+        await self._mcp_registry.stop()
+        self._mcp_registry = MCPRegistry(getattr(config, "mcp_servers", []) or [])
+        await self._mcp_registry.start()
+        self.unified_registry.set_mcp_registry(self._mcp_registry)
+        _register_mcp_tools(self.tool_registry, self.unified_registry, self._mcp_registry)
         self.control_channel = (config.runtime.control_channel or "").strip()
         self.control_chat_id = config.runtime.control_chat_id
         self.control_connector = config.runtime.control_connector
@@ -457,6 +478,93 @@ def _register_google(tool_registry: ToolRegistry, config, db) -> None:
             client_secret=client_secret,
             db=db,
         )
+
+
+def _register_mcp_tools(
+    tool_registry: ToolRegistry,
+    unified_registry: UnifiedToolRegistry,
+    mcp_registry: MCPRegistry,
+) -> None:
+    """Expose discovered MCP tools through the main ToolRegistry.
+
+    Worker and spawned agents execute tools through ToolRegistry. MCP tools are
+    discovered at runtime, so we bridge them into ToolRegistry after MCP startup.
+    """
+    discovered = mcp_registry.get_all_tools()
+    if not discovered:
+        logger.info("No MCP tools discovered to register")
+        return
+
+    for prefixed_name, tool_def in discovered.items():
+        schema = tool_def.get("schema") or {"type": "object", "properties": {}}
+        description = str(tool_def.get("description", "") or "")
+
+        async def _handler(args, _name=prefixed_name):
+            content = await mcp_registry.call_tool(_name, args or {})
+            return _mcp_content_to_tool_result(_name, content)
+
+        tool = Tool(
+            name=prefixed_name,
+            schema=schema,
+            handler=_handler,
+            description=description,
+        )
+        tool_registry.register(tool)
+        unified_registry.register_builtin(tool)
+
+    logger.info("Registered %d MCP tool wrapper(s) into ToolRegistry", len(discovered))
+
+
+def _mcp_content_to_tool_result(tool_name: str, content: List[Dict]) -> ToolResult:
+    """Convert MCP tool content blocks to ToolResult + binary attachments."""
+    text_parts: List[str] = []
+    attachments: List[Attachment] = []
+
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type", "")).lower()
+
+        if item_type == "text":
+            text = str(item.get("text", ""))
+            if text:
+                text_parts.append(text)
+            continue
+
+        # Common MCP image block shape:
+        # {"type":"image","data":"<base64>","mimeType":"image/png",...}
+        if item_type == "image":
+            raw_b64 = str(item.get("data", "") or "")
+            if not raw_b64:
+                continue
+            mime_type = str(item.get("mimeType") or item.get("mime_type") or "image/png")
+            filename = str(item.get("filename") or f"{tool_name}.png")
+            try:
+                raw = base64.b64decode(raw_b64, validate=True)
+            except Exception:
+                # Fallback to non-strict decoding for servers that omit padding.
+                try:
+                    raw = base64.b64decode(raw_b64)
+                except Exception as exc:
+                    text_parts.append(f"[mcp image decode failed: {exc}]")
+                    continue
+            attachments.append(
+                Attachment(
+                    filename=filename,
+                    mime_type=mime_type,
+                    data=raw,
+                )
+            )
+            continue
+
+    if not text_parts and attachments:
+        text_parts.append(f"Generated {len(attachments)} attachment(s).")
+
+    return ToolResult(
+        content="\n".join(text_parts).strip(),
+        data={"mcp_content": content},
+        attachments=attachments,
+    )
 
 
 def _apply_worker_path(config) -> None:

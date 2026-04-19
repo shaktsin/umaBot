@@ -96,6 +96,38 @@ tools:
         shell: false         # no shell in Downloads
 
 # ---------------------------------------------------------------------------
+# MCP Servers — Model Context Protocol tool servers
+# Each server is started as a subprocess; its tools become available to agents
+# as  mcp_<name>_<tool>  (e.g. mcp_playwright_screenshot).
+# Requires the server package to be installed (e.g. via npx or pip).
+# ---------------------------------------------------------------------------
+mcp_servers: []
+# mcp_servers:
+#   - name: playwright           # browser automation + screenshots
+#     command: npx
+#     args: ["@playwright/mcp@latest", "--headless"]
+#     enabled: true
+#
+#   - name: filesystem           # file read/write in a sandboxed directory
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "~/projects"]
+#     enabled: true
+#
+#   - name: github               # GitHub issues, PRs, repos
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-github"]
+#     env:
+#       GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
+#     enabled: false
+#
+#   - name: postgres             # query a PostgreSQL database
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-postgres"]
+#     env:
+#       DATABASE_URL: "postgresql://user:pass@localhost/mydb"
+#     enabled: false
+
+# ---------------------------------------------------------------------------
 # Skills — agent capability packs loaded from SKILL.md directories
 # ---------------------------------------------------------------------------
 

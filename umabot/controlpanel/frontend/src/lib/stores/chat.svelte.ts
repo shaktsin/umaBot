@@ -5,6 +5,7 @@ class ChatStore {
   messages = $state<ChatMessage[]>([]);
   loading = $state(false);
   sending = $state(false);
+  private localSeq = 0;
 
   async loadHistory() {
     this.loading = true;
@@ -19,7 +20,15 @@ class ChatStore {
   }
 
   addMessage(msg: ChatMessage) {
-    this.messages = [...this.messages, msg];
+    const normalized: ChatMessage = { ...msg };
+    if (!normalized.created_at) {
+      normalized.created_at = new Date().toISOString();
+    }
+    if (typeof normalized.id !== 'number') {
+      // Keep local WS-only messages uniquely keyed in UI.
+      normalized.id = -Math.floor(Date.now() * 1000 + (this.localSeq++ % 1000));
+    }
+    this.messages = [...this.messages, normalized];
   }
 
   removeLastPending() {

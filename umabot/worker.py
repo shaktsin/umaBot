@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import mimetypes
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,9 +22,11 @@ from umabot.storage import Database, Queue
 from umabot.tasks.parser import parse_control_task_request
 from umabot.tasks.schedule import compute_initial_next_run_at, compute_next_run_at
 from umabot.tools import ToolRegistry, UnifiedToolRegistry
+from umabot.tools.registry import Attachment
 from umabot.tools.builtin import set_active_skill_env
 from umabot.tools.workspace import (
     detect_workspace_from_text,
+    get_active_workspace,
     resolve_workspace,
     set_active_workspace,
 )
@@ -399,31 +402,21 @@ class Worker:
                     "Routing to DynamicOrchestrator kind=%s session_id=%s",
                     kind, session_id,
                 )
-                # Pass the active skill's instructions to the orchestrator so it
-                # can include them in the spawned agent's system_prompt.
-                # We pass only the first 3000 chars to the orchestrator system prompt
-                # (to stay within rate limits); the full body goes to the agent context.
+                # Progressive disclosure: only tell the orchestrator WHICH skill
+                # matched. The orchestrator (or its spawned agent) must call
+                # skill.get_instructions(skill_name=...) to retrieve the full body.
+                # This avoids dumping thousands of tokens into every LLM call upfront.
                 skill_context = ""
-                if matched_skill and matched_skill.metadata.body:
-                    body = matched_skill.metadata.body
+                if matched_skill:
                     skill_context = (
                         f"ACTIVE SKILL: {matched_skill.metadata.name}\n"
                         f"Skill directory: {matched_skill.path}\n"
-                        f"Instructions (give the FULL text below to the relevant spawned agent's system_prompt and context):\n"
-                        f"{body[:3000]}"
-                        + ("... [truncated — pass full instructions to agent context]" if len(body) > 3000 else "")
+                        f"The user's request matches this skill. Use skill.get_instructions(skill_name='{matched_skill.metadata.name}') "
+                        f"to load the full instructions before spawning the specialist agent."
                     )
-                    # Store full body so orchestrator can include it in agent context
-                    # by referencing skill_context_full
-                skill_context_full = ""
-                if matched_skill and matched_skill.metadata.body:
-                    skill_context_full = (
-                        f"ACTIVE SKILL: {matched_skill.metadata.name}\n"
-                        f"Skill directory: {matched_skill.path}\n"
-                        f"{matched_skill.metadata.body}"
-                    )
+                skill_context_full = ""  # No longer pre-loaded; fetched on demand
                 try:
-                    final_reply = await self._run_with_orchestrator(
+                    final_reply, final_attachments = await self._run_with_orchestrator(
                         task=text,
                         history=messages,
                         channel=channel,
@@ -441,8 +434,19 @@ class Worker:
                     await self._notify(channel, chat_id, f"Orchestrator failed: {exc}", connector, connector_role=connector_role)
                     return
                 if final_reply:
-                    self.db.add_message(session_id, "assistant", final_reply)
-                    await self._notify(channel, chat_id, final_reply, connector, connector_role=connector_role)
+                    if not final_attachments:
+                        final_attachments = self._build_orchestrator_attachment_fallback(final_reply)
+                    message_id = self.db.add_message(session_id, "assistant", final_reply)
+                    if final_attachments:
+                        self.db.add_message_attachments(message_id, final_attachments)
+                    await self._notify(
+                        channel,
+                        chat_id,
+                        final_reply,
+                        connector,
+                        connector_role=connector_role,
+                        attachments=final_attachments,
+                    )
                 return
             if using_orchestrator and is_gmail_listener_flow:
                 logger.info(
@@ -702,8 +706,10 @@ class Worker:
 
             follow_up = await self.llm_client.generate(messages, tools=None)
             if follow_up.content:
-                self.db.add_message(session_id, "assistant", follow_up.content)
                 serialized = [a.to_dict() for a in pending_attachments] if pending_attachments else None
+                message_id = self.db.add_message(session_id, "assistant", follow_up.content)
+                if serialized:
+                    self.db.add_message_attachments(message_id, serialized)
                 await self._notify(channel, chat_id, follow_up.content, connector, connector_role=connector_role, attachments=serialized)
 
     async def _run_with_orchestrator(
@@ -720,8 +726,8 @@ class Worker:
         skill_context: str = "",
         skill_context_full: str = "",
         connector_role: str = "admin",
-    ) -> str:
-        """Delegate a task to the DynamicOrchestrator and return the final reply."""
+    ) -> tuple[str, Optional[list]]:
+        """Delegate to DynamicOrchestrator and return final reply + attachments."""
         configured_workspaces = getattr(
             getattr(self.config, "tools", None), "workspaces", []
         ) or []
@@ -745,7 +751,41 @@ class Worker:
             workspaces=configured_workspaces,
         )
 
-        return await orchestrator.run(task=task, history=history)
+        final_reply = await orchestrator.run(task=task, history=history)
+        serialized = [a.to_dict() for a in orchestrator.collected_attachments]
+        return final_reply, (serialized or None)
+
+    def _build_orchestrator_attachment_fallback(self, final_reply: str) -> Optional[list]:
+        """Attach local image files referenced in text when tools returned none."""
+        candidates = _extract_image_path_candidates(final_reply)
+        if not candidates:
+            return None
+
+        roots: List[Path] = []
+        active_ws = get_active_workspace()
+        if active_ws:
+            try:
+                roots.append(Path(active_ws.path).expanduser().resolve())
+            except Exception:
+                pass
+
+        for ws in (getattr(getattr(self.config, "tools", None), "workspaces", []) or []):
+            try:
+                roots.append(Path(ws.path).expanduser().resolve())
+            except Exception:
+                continue
+
+        # Final fallback for relative paths in local development runs.
+        roots.append(Path.cwd().resolve())
+
+        attachments = _attachments_from_image_candidates(candidates, roots)
+        if not attachments:
+            return None
+        logger.info(
+            "Attachment fallback added %d image(s) from assistant text references",
+            len(attachments),
+        )
+        return [a.to_dict() for a in attachments]
 
     async def _process_task_run(self, payload: Dict[str, Any]) -> None:
         task_id = int(payload.get("task_id", 0))
@@ -1130,6 +1170,103 @@ def _is_explicit_admin_gmail_search_request(
     if "gmail.search" in lower:
         return True
     return bool(_RE_GMAIL_SEARCH_PHRASE.search(lower))
+
+
+_RE_IMAGE_PATH_CANDIDATE = re.compile(
+    r"[`'\"]?([^\s`'\"<>]+?\.(?:png|jpe?g|webp|gif|bmp))[`'\"]?",
+    re.IGNORECASE,
+)
+_MAX_FALLBACK_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+
+def _extract_image_path_candidates(text: str) -> List[str]:
+    """Extract image-like path tokens from assistant text."""
+    out: List[str] = []
+    for m in _RE_IMAGE_PATH_CANDIDATE.finditer(text or ""):
+        raw = (m.group(1) or "").strip().strip("()[]{}<>,;:")
+        if not raw:
+            continue
+        lower = raw.lower()
+        if lower.startswith(("http://", "https://", "data:")):
+            continue
+        out.append(raw)
+    # Keep order, de-duplicate
+    deduped: List[str] = []
+    seen = set()
+    for item in out:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _attachments_from_image_candidates(candidates: List[str], roots: List[Path]) -> List[Attachment]:
+    """Resolve image candidates against roots and load them as attachments."""
+    attachments: List[Attachment] = []
+    seen_paths: set[str] = set()
+
+    unique_roots: List[Path] = []
+    for r in roots:
+        key = str(r)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        unique_roots.append(r)
+    seen_paths.clear()
+
+    for raw in candidates:
+        token = raw.strip().strip("`'\"")
+        if not token:
+            continue
+
+        p = Path(token).expanduser()
+        probes: List[Path] = []
+        if p.is_absolute():
+            probes.append(p)
+        else:
+            for root in unique_roots:
+                probes.append(root / p)
+                if p.parent == Path("."):
+                    # Common model output: bare filename; look one level deep.
+                    probes.extend(root.glob(f"**/{p.name}"))
+
+        for probe in probes:
+            try:
+                resolved = probe.resolve()
+            except Exception:
+                continue
+            key = str(resolved)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            size = resolved.stat().st_size
+            if size <= 0 or size > _MAX_FALLBACK_IMAGE_BYTES:
+                continue
+
+            suffix = resolved.suffix.lower()
+            if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
+                continue
+
+            mime_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
+            try:
+                raw_bytes = resolved.read_bytes()
+            except Exception:
+                continue
+
+            attachments.append(
+                Attachment(
+                    filename=resolved.name,
+                    mime_type=mime_type,
+                    data=raw_bytes,
+                )
+            )
+            break
+
+    return attachments
 
 
 def _load_agent_context(context_file: str) -> str:
