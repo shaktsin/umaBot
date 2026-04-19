@@ -6,11 +6,8 @@ Tell it to manage your calendar, run scripts, browse the web, or handle anything
 
 ## Demo
 
-- <video controls width="100%" src="https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4">
-  Your browser does not support the video tag.
-  </video>
-- If the player does not render on your client, use the direct link:
-  [umaBot.mp4](https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4)
+- [![UmaBot demo preview](media/umabot-demo-preview.png)](https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4)
+- Demo video direct link: [umaBot.mp4](https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4)
 
 ---
 
