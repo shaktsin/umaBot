@@ -4,10 +4,7 @@ A modular, daemon-based AI assistant with pluggable skills and multi-channel sup
 
 Tell it to manage your calendar, run scripts, browse the web, or handle anything you'd otherwise do manually. It asks for your approval before doing anything risky, and you can extend it with skills.
 
-## Demo
-
-- ![UmaBot demo](media/umabot-demo.gif)
-- Demo video: [umaBot.mp4](https://github.com/shaktsin/umaBot/releases/download/demo-v2/umaBot.mp4)
+![UmaBot demo](media/umabot-demo.gif)
 
 ---
 
