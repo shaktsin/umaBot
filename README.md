@@ -1,6 +1,6 @@
 # UmaBot
 
-A modular, daemon-based AI assistant with pluggable skills and multi-channel support.
+A modular, multi-agent AI assistant with pluggable skills, mcps and multi-channel support.
 
 Tell it to manage your calendar, run scripts, browse the web, or handle anything you'd otherwise do manually. It asks for your approval before doing anything risky, and you can extend it with skills.
 
