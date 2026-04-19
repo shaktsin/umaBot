@@ -9,12 +9,20 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from umabot.llm.base import LLMClient, LLMResponse, compress_tool_output
+from umabot.tools.registry import Attachment, ToolResult
 
 logger = logging.getLogger("umabot.agents.agent")
+
+
+@dataclass
+class AgentRunResult:
+    content: str
+    attachments: List[Attachment] = field(default_factory=list)
 
 
 class SpawnedAgent:
@@ -56,8 +64,8 @@ class SpawnedAgent:
         self.max_iterations = max_iterations
         self.on_tool_call = on_tool_call
 
-    async def run(self) -> str:
-        """Execute the agent's agentic tool loop and return a final result string."""
+    async def run(self) -> AgentRunResult:
+        """Execute the agent loop and return final text + tool attachments."""
         user_content = f"Objective: {self.objective}"
         if self.context:
             user_content += f"\n\nContext:\n{self.context}"
@@ -66,6 +74,7 @@ class SpawnedAgent:
             {"role": "system", "content": _inject_date(self.system_prompt)},
             {"role": "user", "content": user_content},
         ]
+        collected_attachments: List[Attachment] = []
 
         tools_spec = self._build_tools_spec()
         logger.info(
@@ -93,12 +102,17 @@ class SpawnedAgent:
 
             if not response.tool_calls:
                 # Agent is done
-                return response.content or ""
+                return AgentRunResult(
+                    content=response.content or "",
+                    attachments=collected_attachments,
+                )
 
             # Execute tool calls
             for tool_call in response.tool_calls:
-                result_content = await self._execute_tool(tool_call.name, tool_call.arguments)
-                stored_content = compress_tool_output(result_content)
+                result = await self._execute_tool(tool_call.name, tool_call.arguments)
+                if result.attachments:
+                    collected_attachments.extend(result.attachments)
+                stored_content = compress_tool_output(result.content or "")
                 tool_message: Dict[str, Any] = {
                     "role": "tool",
                     "content": stored_content,
@@ -111,25 +125,27 @@ class SpawnedAgent:
         # Max iterations reached — force a final answer without tools
         logger.warning("Agent role=%s reached max_iterations=%d, forcing final answer", self.role, self.max_iterations)
         final = await self.llm_client.generate(messages, tools=None)
-        return final.content or f"[{self.role}] reached iteration limit without completing the objective."
+        return AgentRunResult(
+            content=final.content or f"[{self.role}] reached iteration limit without completing the objective.",
+            attachments=collected_attachments,
+        )
 
-    async def _execute_tool(self, name: str, arguments: Dict[str, Any]) -> str:
+    async def _execute_tool(self, name: str, arguments: Dict[str, Any]) -> ToolResult:
         if self.on_tool_call:
             try:
                 await self.on_tool_call(name, arguments)
             except Exception as exc:
-                return f"Tool blocked: {exc}"
+                return ToolResult(content=f"Tool blocked: {exc}")
 
         tool = self.tool_registry.get(name)
         if not tool:
             logger.warning("Agent role=%s requested unknown tool=%s", self.role, name)
-            return f"Tool '{name}' not found."
+            return ToolResult(content=f"Tool '{name}' not found.")
         try:
-            result = await tool.handler(arguments)
-            return result.content or ""
+            return await tool.handler(arguments)
         except Exception as exc:
             logger.exception("Agent role=%s tool=%s failed", self.role, name)
-            return f"Tool '{name}' failed: {exc}"
+            return ToolResult(content=f"Tool '{name}' failed: {exc}")
 
     def _build_tools_spec(self) -> List[Dict[str, Any]]:
         specs = []
@@ -177,10 +193,31 @@ def _trim_messages(
     keep_head: int = 2,
     keep_tail: int = 6,
 ) -> List[Dict[str, Any]]:
-    """Return messages with head + tail kept and middle trimmed."""
+    """Return messages with head + tail kept and middle trimmed.
+
+    Ensures the tail slice never starts on an orphaned tool/tool_result message —
+    Claude requires every tool_result to have a matching tool_use in the preceding
+    assistant message.  We expand the tail leftward until it starts on a
+    system or user message (i.e. a safe conversation boundary).
+    """
     if len(messages) <= keep_head + keep_tail:
         return messages
-    return messages[:keep_head] + messages[-keep_tail:]
+
+    tail_start = len(messages) - keep_tail
+
+    # Walk left until tail_start points to a system or user message so we
+    # never split an assistant-tool_use / tool_result pair.
+    while tail_start > keep_head:
+        role = messages[tail_start].get("role", "")
+        if role in ("system", "user"):
+            break
+        tail_start -= 1
+
+    # If we couldn't find a clean boundary, just return the full list
+    if tail_start <= keep_head:
+        return messages
+
+    return messages[:keep_head] + messages[tail_start:]
 
 
 def _assistant_message(response: LLMResponse) -> Dict[str, Any]:

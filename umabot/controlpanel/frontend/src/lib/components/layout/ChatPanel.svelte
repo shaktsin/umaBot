@@ -61,7 +61,7 @@
         <p class="text-xs text-zinc-600 mt-1">Send a message to umaBot</p>
       </div>
     {:else}
-      {#each chatStore.messages as msg (msg.id ?? msg.content + msg.role)}
+      {#each chatStore.messages as msg (msg.id ?? msg.created_at ?? msg.content + msg.role)}
         <MessageBubble {msg} />
       {/each}
       {#if chatStore.sending}

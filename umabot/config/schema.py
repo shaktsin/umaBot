@@ -219,6 +219,48 @@ class ToolsConfig:
 
 
 @dataclass
+class MCPServerConfig:
+    """Configuration for a single MCP (Model Context Protocol) server.
+
+    Two transports are supported:
+
+    ``stdio`` (default) — umabot spawns the server as a child process and
+    communicates via stdin/stdout.  Use for local servers installed via npm/pip.
+
+    ``http`` — the server is already running (e.g. in Docker) and umabot
+    connects over HTTP.  Uses the MCP Streamable HTTP transport: each
+    JSON-RPC request is a POST to ``url`` and the response is either plain
+    JSON or an SSE stream, depending on what the server returns.
+
+    Example config.yaml::
+
+        mcp_servers:
+          # stdio — umabot spawns this
+          - name: playwright
+            transport: stdio          # default, can be omitted
+            command: npx
+            args: ["@playwright/mcp@latest", "--headless"]
+
+          # http — already running in Docker
+          - name: my_docker_mcp
+            transport: http
+            url: http://localhost:8080
+    """
+
+    name: str = ""
+    # "stdio" (default) or "http"
+    transport: str = "stdio"
+    # --- stdio fields ---
+    command: str = ""
+    args: List[str] = field(default_factory=list)
+    env: Dict[str, Any] = field(default_factory=dict)
+    # --- http fields ---
+    url: str = ""                 # e.g. "http://localhost:8080"
+    # --- common ---
+    enabled: bool = True
+
+
+@dataclass
 class PolicyRuleMatchConfig:
     """Match conditions for a single declarative policy rule.
 
@@ -460,6 +502,7 @@ class Config:
     skill_dirs: List[str] = field(default_factory=list)  # Additional skill directories
     integrations: IntegrationsConfig = field(default_factory=IntegrationsConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
+    mcp_servers: List[MCPServerConfig] = field(default_factory=list)
 
     # Deprecated flat field — kept so existing configs with `google:` still load
     google: GoogleConfig = field(default_factory=GoogleConfig)

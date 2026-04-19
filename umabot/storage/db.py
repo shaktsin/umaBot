@@ -47,6 +47,15 @@ class Database:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(message_id) REFERENCES messages(id)
                 );
+                CREATE TABLE IF NOT EXISTS message_attachments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL,
+                    filename TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    data_b64 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(message_id) REFERENCES messages(id)
+                );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_type TEXT NOT NULL,
@@ -164,6 +173,54 @@ class Database:
                 "INSERT INTO tool_calls (message_id, tool_name, args_json, result_json, created_at) VALUES (?, ?, ?, ?, ?)",
                 (message_id, tool_name, json.dumps(args), json.dumps(result), _now()),
             )
+
+    def add_message_attachments(self, message_id: int, attachments: List[Dict[str, Any]]) -> None:
+        """Persist already-serialized attachments for a message.
+
+        Expected attachment shape:
+          {"filename": str, "mime_type": str, "data": "<base64>"}
+        """
+        if not attachments:
+            return
+        rows = []
+        now = _now()
+        for att in attachments:
+            filename = str(att.get("filename", "")).strip()
+            mime_type = str(att.get("mime_type", "")).strip()
+            data_b64 = str(att.get("data", "")).strip()
+            if not filename or not mime_type or not data_b64:
+                continue
+            rows.append((message_id, filename, mime_type, data_b64, now))
+        if not rows:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany(
+                """
+                INSERT INTO message_attachments (message_id, filename, mime_type, data_b64, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def get_message_attachments(self, message_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT filename, mime_type, data_b64
+                FROM message_attachments
+                WHERE message_id = ?
+                ORDER BY id
+                """,
+                (message_id,),
+            ).fetchall()
+        return [
+            {
+                "filename": row["filename"],
+                "mime_type": row["mime_type"],
+                "data": row["data_b64"],
+            }
+            for row in rows
+        ]
 
     def add_audit(
         self,

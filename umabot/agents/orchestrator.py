@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from umabot.llm.base import LLMClient, LLMResponse, ToolCall
+from umabot.tools.registry import Attachment
 
 from .agent import SpawnedAgent, _assistant_message
 
@@ -56,6 +57,18 @@ Key principles:
   is unavailable if it appears in the catalog below.
 - After receiving agent results, always synthesise and send the final answer
   yourself — do not rely on another spawn_agent call for synthesis.
+
+File-writing rules (CRITICAL):
+- NEVER combine skill loading + large file generation in one agent spawn. Keep them separate.
+- For writing LARGE files (HTML, code > 500 chars): grant shell.run to the agent.
+  Have it write the file with: python3 -c "open('path','w').write('''...content...''')"
+  Do NOT use file.write for large content — the JSON payload size causes API timeouts.
+- Always set workspace= in spawn_agent so the agent operates in the correct directory.
+- For website builds: (1) skill load agent → (2) code generation + shell.run write agent
+  → (3) server start agent → (4) playwright screenshot agent. Keep these as separate spawns.
+- For screenshot/image deliverables: return at least one image attachment in the final admin reply.
+  A filename-only message is not sufficient; you must call screenshot/image tools that emit attachments.
+- Never claim that you cannot attach images. Tool-generated attachments are forwarded automatically.
 
 Available tools for you to call:
 - spawn_agent       : Launch a specialist agent for a sub-task.
@@ -115,12 +128,12 @@ class DynamicOrchestrator:
         self.max_orchestrator_iterations = max_orchestrator_iterations
         self.max_agent_iterations = max_agent_iterations
         self.skill_context = skill_context
-        # Full skill body injected into spawned agents' context (not into orchestrator prompt)
-        self.skill_context_full = skill_context_full
+        self.skill_context_full = skill_context_full  # retained for API compat, no longer pre-injected
         # User-defined standing context from AGENT.md
         self.agent_context = agent_context
         self.skill_registry = skill_registry
         self.workspaces: List = workspaces or []
+        self._collected_attachments: List[Attachment] = []
 
     async def run(self, task: str, history: Optional[List[Dict[str, Any]]] = None) -> str:
         """Run the full orchestration for ``task`` and return the final reply.
@@ -129,10 +142,11 @@ class DynamicOrchestrator:
             task: The user's original message / request.
             history: Optional prior conversation messages for context.
         """
+        self._collected_attachments = []
         tool_catalog = self._build_tool_catalog()
         skill_note = (
-            f"\nACTIVE SKILL: {self.skill_context.splitlines()[0] if self.skill_context else ''}"
-            "\n(Full skill instructions will be injected into each spawned agent automatically.)"
+            f"\n{self.skill_context}"
+            "\nHave the specialist agent call skill.get_instructions first to load the full instructions."
             if self.skill_context else ""
         )
 
@@ -244,25 +258,8 @@ class DynamicOrchestrator:
             f"shell.run cwd defaults to this path."
         )
         system_prompt = system_prompt + workspace_note
-        # Append key skill instructions to the agent's system_prompt.
-        # We prepend a concrete quick-start template so the agent can write the
-        # full script in a SINGLE shell.run call instead of exploring incrementally.
-        if self.skill_context_full:
-            skill_excerpt = self.skill_context_full[:2000]
-            if len(self.skill_context_full) > 2000:
-                skill_excerpt += "\n[...skill instructions truncated for brevity...]"
-            quick_start = (
-                "\n\nIMPORTANT — write the COMPLETE Node.js script in ONE shell.run call, then save it to a .js file and execute it. "
-                "Do NOT run small exploratory commands. The environment already has node + docx module available via NODE_PATH. "
-                "Use this pattern:\n"
-                "shell.run: cat > /tmp/create_doc.js << 'EOF'\n"
-                "const { Document, Packer, Paragraph, TextRun, HeadingLevel } = require('docx');\n"
-                "const fs = require('fs');\n"
-                "const doc = new Document({ sections: [{ children: [ /* your content */ ] }] });\n"
-                "Packer.toBuffer(doc).then(b => { fs.writeFileSync('/tmp/output.docx', b); console.log('saved'); });\n"
-                "EOF\nnode /tmp/create_doc.js"
-            )
-            system_prompt = system_prompt + quick_start + "\n\n" + skill_excerpt
+        # Skill instructions are loaded on demand via skill.get_instructions —
+        # do NOT pre-inject them here to avoid large upfront token usage.
 
         # Validate requested tools — only grant tools that are actually available
         valid_tool_names = [t for t in tool_names if t in self.available_tool_names]
@@ -285,11 +282,22 @@ class DynamicOrchestrator:
 
         try:
             result = await agent.run()
-            logger.info("Agent role=%s completed result_len=%d", role, len(result))
-            return f"[{role} result]\n{result}"
+            if result.attachments:
+                self._collected_attachments.extend(result.attachments)
+            logger.info(
+                "Agent role=%s completed result_len=%d attachments=%d",
+                role,
+                len(result.content or ""),
+                len(result.attachments),
+            )
+            return f"[{role} result]\n{result.content}"
         except Exception as exc:
             logger.exception("Agent role=%s failed", role)
             return f"[{role} failed]: {exc}"
+
+    @property
+    def collected_attachments(self) -> List[Attachment]:
+        return list(self._collected_attachments)
 
     async def _send_update(self, args: Dict[str, Any]) -> str:
         message = str(args.get("message", ""))

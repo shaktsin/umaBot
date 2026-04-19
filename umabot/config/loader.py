@@ -560,6 +560,11 @@ def _load_keychain_secrets(cfg: Config) -> None:
         cfg.telegram.token = _read_keychain_secret("UMABOT_TELEGRAM_TOKEN")
         if debug:
             logger.info("Keychain UMABOT_TELEGRAM_TOKEN loaded")
+    # Propagate telegram token to any telegram_bot connectors that have no token set
+    if cfg.telegram.token:
+        for connector in getattr(cfg, "connectors", []) or []:
+            if getattr(connector, "type", "") == "telegram_bot" and not getattr(connector, "token", None):
+                connector.token = cfg.telegram.token
     if not cfg.discord.token:
         cfg.discord.token = _read_keychain_secret("UMABOT_DISCORD_TOKEN")
         if debug:
