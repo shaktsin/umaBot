@@ -4,7 +4,7 @@ A modular, multi-agent AI assistant with pluggable skills, mcps and multi-channe
 
 Tell it to manage your calendar, run scripts, browse the web, or handle anything you'd otherwise do manually. It asks for your approval before doing anything risky, and you can extend it with skills.
 
-![UmaBot demo](media/umabot-demo.gif)
+![Demo](media/umabot-demo.gif)
 
 ---
 
