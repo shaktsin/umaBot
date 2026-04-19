@@ -1,12 +1,16 @@
 # UmaBot
 
-A self-hosted personal AI assistant you control through chat — Telegram, Discord, or a web panel.
+A modular, daemon-based AI assistant with pluggable skills and multi-channel support.
 
 Tell it to manage your calendar, run scripts, browse the web, or handle anything you'd otherwise do manually. It asks for your approval before doing anything risky, and you can extend it with skills.
 
-![Demo - GIF](https://private-user-images.githubusercontent.com/8604876/580383214-cce832cb-142c-4c37-9263-4a9d2496654e.gif?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NzY1NjMxMDEsIm5iZiI6MTc3NjU2MjgwMSwicGF0aCI6Ii84NjA0ODc2LzU4MDM4MzIxNC1jY2U4MzJjYi0xNDJjLTRjMzctOTI2My00YTlkMjQ5NjY1NGUuZ2lmP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDQxOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjA0MTlUMDE0MDAxWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9ODZlMzhkYTY0OTNhYTc5MTBjNzAwOTRiOTBhMzgzZDlhOTkzOGQ1YTk2OTEwNTRiZGZmMzNlN2VmY2I2OTI4ZSZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QmcmVzcG9uc2UtY29udGVudC10eXBlPWltYWdlJTJGZ2lmIn0.ZPbNXEf1rx31QgWHpzPzSKvuKsQXxM1xiC8XOskKvsE)
+## Demo
 
-![Demo - Video](https://private-user-images.githubusercontent.com/8604876/580382783-5285c86a-0abc-42fc-8dbf-41ee6d97d587.mp4?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NzY1NjMxNTUsIm5iZiI6MTc3NjU2Mjg1NSwicGF0aCI6Ii84NjA0ODc2LzU4MDM4Mjc4My01Mjg1Yzg2YS0wYWJjLTQyZmMtOGRiZi00MWVlNmQ5N2Q1ODcubXA0P1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI2MDQxOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNjA0MTlUMDE0MDU1WiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9YTk4NDYxODUzY2U5YTIyNDhjNGNlN2EwNmMyNTI3ZGZjZjEzYjAwOGM2MDcwZmJlMzYyYWM2Zjc5MzI3MjUxYyZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QmcmVzcG9uc2UtY29udGVudC10eXBlPXZpZGVvJTJGbXA0In0.VrwO6kQ-tvsDX3gjd8sn48n-Llv-TMANsi60tfSwvu8)
+Demo media links were removed because they used expiring signed `private-user-images` URLs.
+
+- Demo video: [umaBot.mp4](https://github.com/shaktsin/umabot/releases/download/demo-v2/umaBot.mp4)
+- Recommended stable asset format:
+  `https://github.com/shaktsin/umabot/releases/download/<tag>/umabot-demo.mp4`
 
 ---
 
