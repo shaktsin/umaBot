@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -126,6 +126,81 @@ class Database:
                     connector TEXT PRIMARY KEY,
                     last_uid INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_teams (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    team_type TEXT NOT NULL DEFAULT 'orchestrator_worker',
+                    confidence_threshold REAL NOT NULL DEFAULT 0.62,
+                    fit_policy_json TEXT NOT NULL DEFAULT '{}',
+                    budget_policy_json TEXT NOT NULL DEFAULT '{}',
+                    retry_policy_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_team_members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    objective_template TEXT NOT NULL DEFAULT '',
+                    output_schema_json TEXT NOT NULL DEFAULT '{}',
+                    model TEXT NOT NULL DEFAULT '',
+                    tool_allowlist_json TEXT NOT NULL DEFAULT '[]',
+                    skill_allowlist_json TEXT NOT NULL DEFAULT '[]',
+                    workspace TEXT NOT NULL DEFAULT '',
+                    order_index INTEGER NOT NULL DEFAULT 0,
+                    max_tool_calls INTEGER NOT NULL DEFAULT 0,
+                    max_iterations INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(team_id) REFERENCES agent_teams(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS agent_team_routes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    route_type TEXT NOT NULL,
+                    pattern_or_hint TEXT NOT NULL,
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    FOREIGN KEY(team_id) REFERENCES agent_teams(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS agent_skills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    skill_key TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    version TEXT NOT NULL DEFAULT '1.0.0',
+                    required_tools_json TEXT NOT NULL DEFAULT '[]',
+                    prompt_template TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_team_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER,
+                    run_id TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    complexity_class TEXT NOT NULL DEFAULT 'simple',
+                    selected_by TEXT NOT NULL DEFAULT 'rule',
+                    budget_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    route_rationale_json TEXT NOT NULL DEFAULT '{}',
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS agent_team_checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    step_key TEXT NOT NULL,
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_team_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
                 );
                 """
             )
@@ -548,6 +623,410 @@ class Database:
                 (_now(), task_id),
             )
 
+    # ------------------------------------------------------------------
+    # Agent teams and multi-agent telemetry
+    # ------------------------------------------------------------------
+
+    def list_agent_teams(self, *, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM agent_teams"
+        params: tuple[Any, ...] = ()
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY priority DESC, id ASC"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [self._agent_team_row_to_dict(row) for row in rows]
+
+    def get_agent_team(self, team_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM agent_teams WHERE id = ?", (team_id,)).fetchone()
+        if not row:
+            return None
+        return self._agent_team_row_to_dict(row)
+
+    def create_agent_team(self, payload: Dict[str, Any]) -> int:
+        now = _now()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO agent_teams (
+                    name, description, enabled, priority, team_type, confidence_threshold,
+                    fit_policy_json, budget_policy_json, retry_policy_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(payload.get("name", "")).strip(),
+                    str(payload.get("description", "")),
+                    1 if bool(payload.get("enabled", True)) else 0,
+                    int(payload.get("priority", 0) or 0),
+                    str(payload.get("team_type", "orchestrator_worker")),
+                    float(payload.get("confidence_threshold", 0.62) or 0.62),
+                    json.dumps(payload.get("fit_policy", {}) or {}),
+                    json.dumps(payload.get("budget_policy", {}) or {}),
+                    json.dumps(payload.get("retry_policy", {}) or {}),
+                    now,
+                    now,
+                ),
+            )
+            team_id = int(cur.lastrowid)
+            self._replace_agent_team_members(team_id, payload.get("members", []) or [])
+            self._replace_agent_team_routes(team_id, payload.get("routes", []) or [])
+        return team_id
+
+    def update_agent_team(self, team_id: int, payload: Dict[str, Any]) -> bool:
+        existing = self.get_agent_team(team_id)
+        if not existing:
+            return False
+        merged = dict(existing)
+        merged.update(payload or {})
+        now = _now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE agent_teams SET
+                    name = ?, description = ?, enabled = ?, priority = ?, team_type = ?,
+                    confidence_threshold = ?, fit_policy_json = ?, budget_policy_json = ?,
+                    retry_policy_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(merged.get("name", "")).strip(),
+                    str(merged.get("description", "")),
+                    1 if bool(merged.get("enabled", True)) else 0,
+                    int(merged.get("priority", 0) or 0),
+                    str(merged.get("team_type", "orchestrator_worker")),
+                    float(merged.get("confidence_threshold", 0.62) or 0.62),
+                    json.dumps(merged.get("fit_policy", {}) or {}),
+                    json.dumps(merged.get("budget_policy", {}) or {}),
+                    json.dumps(merged.get("retry_policy", {}) or {}),
+                    now,
+                    team_id,
+                ),
+            )
+            if "members" in payload:
+                self._replace_agent_team_members(team_id, payload.get("members", []) or [])
+            if "routes" in payload:
+                self._replace_agent_team_routes(team_id, payload.get("routes", []) or [])
+        return True
+
+    def delete_agent_team(self, team_id: int) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM agent_teams WHERE id = ?", (team_id,))
+            return int(cur.rowcount) > 0
+
+    def list_agent_skills(self, *, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM agent_skills"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY name ASC, id ASC"
+        with self._lock:
+            rows = self._conn.execute(query).fetchall()
+        return [self._agent_skill_row_to_dict(row) for row in rows]
+
+    def get_agent_skill(self, skill_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM agent_skills WHERE id = ?", (skill_id,)).fetchone()
+        if not row:
+            return None
+        return self._agent_skill_row_to_dict(row)
+
+    def upsert_agent_skill(self, payload: Dict[str, Any], *, skill_id: Optional[int] = None) -> int:
+        now = _now()
+        with self._lock, self._conn:
+            if skill_id is None:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO agent_skills (
+                        skill_key, name, description, version, required_tools_json,
+                        prompt_template, enabled, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(payload.get("skill_key", "")).strip(),
+                        str(payload.get("name", "")).strip(),
+                        str(payload.get("description", "")),
+                        str(payload.get("version", "1.0.0")),
+                        json.dumps(payload.get("required_tools", []) or []),
+                        str(payload.get("prompt_template", "")),
+                        1 if bool(payload.get("enabled", True)) else 0,
+                        now,
+                        now,
+                    ),
+                )
+                return int(cur.lastrowid)
+
+            self._conn.execute(
+                """
+                UPDATE agent_skills SET
+                    skill_key = ?, name = ?, description = ?, version = ?,
+                    required_tools_json = ?, prompt_template = ?, enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(payload.get("skill_key", "")).strip(),
+                    str(payload.get("name", "")).strip(),
+                    str(payload.get("description", "")),
+                    str(payload.get("version", "1.0.0")),
+                    json.dumps(payload.get("required_tools", []) or []),
+                    str(payload.get("prompt_template", "")),
+                    1 if bool(payload.get("enabled", True)) else 0,
+                    now,
+                    int(skill_id),
+                ),
+            )
+            return int(skill_id)
+
+    def delete_agent_skill(self, skill_id: int) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM agent_skills WHERE id = ?", (skill_id,))
+            return int(cur.rowcount) > 0
+
+    def create_agent_team_run(
+        self,
+        *,
+        run_id: str,
+        team_id: Optional[int],
+        status: str,
+        complexity_class: str,
+        selected_by: str,
+        budget_snapshot: Dict[str, Any],
+        route_rationale: Dict[str, Any],
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO agent_team_runs (
+                    team_id, run_id, status, complexity_class, selected_by,
+                    budget_snapshot_json, route_rationale_json, started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    team_id,
+                    run_id,
+                    status,
+                    complexity_class,
+                    selected_by,
+                    json.dumps(budget_snapshot or {}),
+                    json.dumps(route_rationale or {}),
+                    _now(),
+                ),
+            )
+
+    def complete_agent_team_run(self, *, run_id: str, status: str = "completed") -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE agent_team_runs SET status = ?, completed_at = ? WHERE run_id = ?",
+                (status, _now(), run_id),
+            )
+
+    def add_agent_team_checkpoint(self, *, run_id: str, step_key: str, state: Dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO agent_team_checkpoints (run_id, step_key, state_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (run_id, step_key, json.dumps(state or {}), _now()),
+            )
+
+    def add_agent_team_event(self, *, run_id: str, event_name: str, payload: Dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO agent_team_events (run_id, event_name, payload_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (run_id, event_name, json.dumps(payload or {}), _now()),
+            )
+
+    def list_agent_team_runs(self, *, limit: int = 50, status: str = "") -> List[Dict[str, Any]]:
+        query = "SELECT * FROM agent_team_runs"
+        params: List[Any] = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(int(max(1, min(limit, 500))))
+        with self._lock:
+            rows = self._conn.execute(query, tuple(params)).fetchall()
+        return [self._agent_team_run_row_to_dict(row) for row in rows]
+
+    def get_agent_team_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM agent_team_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if not row:
+            return None
+        return self._agent_team_run_row_to_dict(row)
+
+    def list_agent_team_checkpoints(self, run_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT step_key, state_json, created_at
+                FROM agent_team_checkpoints
+                WHERE run_id = ?
+                ORDER BY id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            {
+                "step_key": row["step_key"],
+                "state": _loads_json(row["state_json"], default={}),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def list_agent_team_events(self, run_id: str, *, limit: int = 1000) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT event_name, payload_json, created_at
+                FROM agent_team_events
+                WHERE run_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (run_id, int(max(1, min(limit, 5000)))),
+            ).fetchall()
+        return [
+            {
+                "event_name": row["event_name"],
+                "payload": _loads_json(row["payload_json"], default={}),
+                "created_at": row["created_at"],
+            }
+            for row in reversed(rows)
+        ]
+
+    def _replace_agent_team_members(self, team_id: int, members: List[Dict[str, Any]]) -> None:
+        self._conn.execute("DELETE FROM agent_team_members WHERE team_id = ?", (team_id,))
+        for idx, member in enumerate(members):
+            self._conn.execute(
+                """
+                INSERT INTO agent_team_members (
+                    team_id, role, objective_template, output_schema_json, model,
+                    tool_allowlist_json, skill_allowlist_json, workspace, order_index,
+                    max_tool_calls, max_iterations
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    team_id,
+                    str(member.get("role", "member")),
+                    str(member.get("objective_template", "")),
+                    json.dumps(member.get("output_schema", {}) or {}),
+                    str(member.get("model", "")),
+                    json.dumps(member.get("tool_allowlist", []) or []),
+                    json.dumps(member.get("skill_allowlist", []) or []),
+                    str(member.get("workspace", "")),
+                    int(member.get("order_index", idx) or idx),
+                    int(member.get("max_tool_calls", 0) or 0),
+                    int(member.get("max_iterations", 0) or 0),
+                ),
+            )
+
+    def _replace_agent_team_routes(self, team_id: int, routes: List[Dict[str, Any]]) -> None:
+        self._conn.execute("DELETE FROM agent_team_routes WHERE team_id = ?", (team_id,))
+        for route in routes:
+            self._conn.execute(
+                """
+                INSERT INTO agent_team_routes (team_id, route_type, pattern_or_hint, weight)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    team_id,
+                    str(route.get("route_type", "keyword")),
+                    str(route.get("pattern_or_hint", "")),
+                    float(route.get("weight", 1.0) or 1.0),
+                ),
+            )
+
+    def _list_agent_team_members(self, team_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM agent_team_members WHERE team_id = ? ORDER BY order_index ASC, id ASC",
+                (team_id,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "role": row["role"],
+                "objective_template": row["objective_template"],
+                "output_schema": _loads_json(row["output_schema_json"], default={}),
+                "model": row["model"],
+                "tool_allowlist": _loads_json(row["tool_allowlist_json"], default=[]),
+                "skill_allowlist": _loads_json(row["skill_allowlist_json"], default=[]),
+                "workspace": row["workspace"],
+                "order_index": int(row["order_index"]),
+                "max_tool_calls": int(row["max_tool_calls"] or 0),
+                "max_iterations": int(row["max_iterations"] or 0),
+            }
+            for row in rows
+        ]
+
+    def _list_agent_team_routes(self, team_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM agent_team_routes WHERE team_id = ? ORDER BY id ASC",
+                (team_id,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "route_type": row["route_type"],
+                "pattern_or_hint": row["pattern_or_hint"],
+                "weight": float(row["weight"] or 0.0),
+            }
+            for row in rows
+        ]
+
+    def _agent_team_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        team_id = int(row["id"])
+        return {
+            "id": team_id,
+            "name": row["name"],
+            "description": row["description"],
+            "enabled": bool(row["enabled"]),
+            "priority": int(row["priority"] or 0),
+            "team_type": row["team_type"],
+            "confidence_threshold": float(row["confidence_threshold"] or 0.62),
+            "fit_policy": _loads_json(row["fit_policy_json"], default={}),
+            "budget_policy": _loads_json(row["budget_policy_json"], default={}),
+            "retry_policy": _loads_json(row["retry_policy_json"], default={}),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "members": self._list_agent_team_members(team_id),
+            "routes": self._list_agent_team_routes(team_id),
+        }
+
+    def _agent_skill_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "skill_key": row["skill_key"],
+            "name": row["name"],
+            "description": row["description"],
+            "version": row["version"],
+            "required_tools": _loads_json(row["required_tools_json"], default=[]),
+            "prompt_template": row["prompt_template"],
+            "enabled": bool(row["enabled"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _agent_team_run_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "team_id": row["team_id"],
+            "run_id": row["run_id"],
+            "status": row["status"],
+            "complexity_class": row["complexity_class"],
+            "selected_by": row["selected_by"],
+            "budget_snapshot": _loads_json(row["budget_snapshot_json"], default={}),
+            "route_rationale": _loads_json(row["route_rationale_json"], default={}),
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+        }
+
     def _task_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         data = dict(row)
         try:
@@ -558,8 +1037,17 @@ class Database:
 
 
 def _now() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _future(seconds: int) -> str:
-    return (datetime.utcnow() + timedelta(seconds=seconds)).isoformat() + "Z"
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+
+def _loads_json(raw: Any, *, default: Any) -> Any:
+    if raw in (None, ""):
+        return default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default

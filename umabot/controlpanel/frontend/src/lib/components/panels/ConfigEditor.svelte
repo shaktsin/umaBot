@@ -38,10 +38,18 @@
     saving = true;
     error = '';
     try {
+      const existingPolicy = (config?.policy as Record<string, unknown> | undefined) ?? {};
+      const existingTools = (config?.tools as Record<string, unknown> | undefined) ?? {};
       await api.updateConfig({
         llm: { provider: llmProvider, model: llmModel },
-        policy: { confirmation_strictness: strictness },
-        tools: { shell_enabled: shellEnabled },
+        policy: {
+          ...existingPolicy,
+          confirmation_strictness: strictness,
+        },
+        tools: {
+          ...existingTools,
+          shell_enabled: shellEnabled,
+        },
       });
       saved = true;
       setTimeout(() => (saved = false), 2000);

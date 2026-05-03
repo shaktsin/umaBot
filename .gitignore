@@ -215,6 +215,7 @@ wa_session/
 *.pid
 config.example.yaml.bak
 /skills/
+/agent_teams/
 
 plans/
 docs/
@@ -229,6 +230,14 @@ package-lock.json
 
 # Claude Code local settings
 .claude/
+
+# Playwright / browser automation local state
+.playwright-mcp/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
 
 # Project-specific: keep out of version control
 CLAUDE.md

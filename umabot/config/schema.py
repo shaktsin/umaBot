@@ -7,6 +7,16 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
+class PanelObservabilityConfig:
+    """Per-panel visibility controls for operational telemetry streams."""
+
+    # none | summary | full
+    multi_agent_topology: str = "summary"
+    # none | summary | full
+    multi_agent_logs: str = "none"
+
+
+@dataclass
 class ControlPanelConfig:
     """
     Owner's private interface for confirmations and management.
@@ -29,6 +39,8 @@ class ControlPanelConfig:
     # For local UIs (cli, web)
     web_host: str = "127.0.0.1"
     web_port: int = 5000
+    # Per-panel observability controls (web/telegram/discord may differ)
+    observability: PanelObservabilityConfig = field(default_factory=PanelObservabilityConfig)
 
 
 # Connector types that are inbound-only (listener role).
@@ -70,6 +82,36 @@ class LLMConfig:
     # For OpenAI reasoning models (o1, o3, o4-mini etc.)
     # Valid values: "low" | "medium" | "high" | None (uses model default)
     reasoning_effort: Optional[str] = None
+
+
+@dataclass
+class LLMProviderConfig:
+    """Configuration for a single LLM provider in the admin registry."""
+
+    enabled: bool = True
+    api_key: Optional[str] = None
+    models: List[str] = field(default_factory=list)
+    default_model: str = ""
+
+
+def _default_llm_providers() -> Dict[str, "LLMProviderConfig"]:
+    return {
+        "openai": LLMProviderConfig(
+            enabled=True,
+            models=["gpt-5.4-mini", "gpt-4o-mini", "o4-mini"],
+            default_model="gpt-5.4-mini",
+        ),
+        "claude": LLMProviderConfig(
+            enabled=True,
+            models=["claude-sonnet-4-6", "claude-opus-4-6"],
+            default_model="claude-sonnet-4-6",
+        ),
+        "gemini": LLMProviderConfig(
+            enabled=True,
+            models=["gemini-2.5-pro", "gemini-2.5-flash"],
+            default_model="gemini-2.5-flash",
+        ),
+    }
 
 
 @dataclass
@@ -254,10 +296,38 @@ class MCPServerConfig:
     command: str = ""
     args: List[str] = field(default_factory=list)
     env: Dict[str, Any] = field(default_factory=dict)
+    # Forward listed env vars from parent process into stdio subprocess env.
+    env_vars: List[str] = field(default_factory=list)
+    # Optional subprocess working directory for stdio transport.
+    cwd: str = ""
     # --- http fields ---
     url: str = ""                 # e.g. "http://localhost:8080"
+    # Reads token from env and injects Authorization: Bearer <token>.
+    bearer_token_env_var: str = ""
+    # Static headers sent on every HTTP request.
+    http_headers: Dict[str, Any] = field(default_factory=dict)
+    # Header-name -> env-var-name mapping resolved at runtime.
+    env_http_headers: Dict[str, Any] = field(default_factory=dict)
     # --- common ---
     enabled: bool = True
+    # If true, startup/reload fails when this server cannot be initialized.
+    required: bool = False
+    # Timeouts (seconds)
+    startup_timeout_sec: float = 10.0
+    tool_timeout_sec: float = 60.0
+    # Tool allow/deny controls (applied to discovered MCP tool names)
+    enabled_tools: List[str] = field(default_factory=list)
+    disabled_tools: List[str] = field(default_factory=list)
+    # Optional OAuth callback overrides for HTTP MCP auth flows.
+    mcp_oauth_callback_port: int = 0
+    mcp_oauth_callback_url: str = ""
+
+    def __post_init__(self) -> None:
+        self.transport = (self.transport or "stdio").strip().lower()
+        if self.startup_timeout_sec <= 0:
+            self.startup_timeout_sec = 10.0
+        if self.tool_timeout_sec <= 0:
+            self.tool_timeout_sec = 60.0
 
 
 @dataclass
@@ -315,6 +385,13 @@ class PolicyRuleConfig:
 @dataclass
 class PolicyConfig:
     confirmation_strictness: str = "normal"  # normal | strict
+    # normal | auto_approve_workspace
+    # auto_approve_workspace bypasses approval prompts for eligible tool calls
+    # that stay inside explicitly allowed workspaces.
+    approval_mode: str = "normal"
+    auto_approve_workspaces: List[str] = field(default_factory=list)
+    auto_approve_tools: List[str] = field(default_factory=list)
+    auto_approve_shell_commands: List[str] = field(default_factory=list)
     # Optional external file containing policy rules to keep config.yaml small.
     # Supports either:
     #   1) top-level "rules: [...]"
@@ -481,8 +558,26 @@ class AgentsConfig:
 
 
 @dataclass
+class AgentTeamsConfig:
+    """Reusable team-registry settings layered on top of dynamic orchestration."""
+
+    enabled: bool = False
+    routing_mode: str = "hybrid"  # rule | llm | hybrid
+    default_confidence_threshold: float = 0.62
+    fallback_to_dynamic: bool = True
+    max_teams_considered: int = 20
+    fit_gate_enabled: bool = True
+    fit_min_query_len: int = 60
+    # Additional directories scanned for TEAM.md packs
+    team_dirs: List[str] = field(default_factory=list)
+    # Writable install target used by control panel install/create actions
+    install_dir: str = "~/.umabot/agent-teams"
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
+    llm_providers: Dict[str, LLMProviderConfig] = field(default_factory=_default_llm_providers)
     # Single primary control panel (kept for backward compat with existing configs).
     # When multiple panels are needed (e.g. web + telegram) populate control_panels
     # list instead — or use both: primary + extras.
@@ -497,6 +592,7 @@ class Config:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     agents: AgentsConfig = field(default_factory=AgentsConfig)
+    agent_teams: AgentTeamsConfig = field(default_factory=AgentTeamsConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     skill_configs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     skill_dirs: List[str] = field(default_factory=list)  # Additional skill directories
@@ -524,6 +620,8 @@ class Config:
             self.policy.rules_file = _expand_path(self.policy.rules_file)
         if self.agents.context_file:
             self.agents.context_file = _expand_path(self.agents.context_file)
+        self.agent_teams.install_dir = _expand_path(self.agent_teams.install_dir)
+        self.agent_teams.team_dirs = [_expand_path(p) for p in self.agent_teams.team_dirs]
         _resolve_skill_runtime_override(self.skills.defaults)
         if not self.skills.defaults.python_bin:
             self.skills.defaults.python_bin = sys.executable
@@ -532,6 +630,9 @@ class Config:
         for ws in self.tools.workspaces:
             if ws.path:
                 ws.path = _expand_path(ws.path)
+        for server in self.mcp_servers:
+            if server.cwd:
+                server.cwd = _expand_path(server.cwd)
 
 
 def _expand_path(path: str) -> str:

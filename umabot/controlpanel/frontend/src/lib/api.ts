@@ -1,7 +1,14 @@
 import type {
+  AgentSkillItem,
+  AgentTeam,
+  AgentTeamRun,
   Attachment,
   AuditEntry,
   Connector,
+  LLMProvidersResponse,
+  MCPMethodsResponse,
+  MCPServerTestResponse,
+  MCPServersResponse,
   PendingConfirmation,
   Skill,
   StatusResponse,
@@ -49,15 +56,88 @@ export const api = {
   getPending: () => fetchJson<PendingConfirmation[]>('/api/policy/pending'),
   confirmAction: (token: string, approved: boolean) =>
     fetchJson('/api/policy/confirm', { method: 'POST', ...json({ token, approved }) }),
+  approveAgentAction: (token: string, approved: boolean) =>
+    fetchJson('/api/policy/agents/approve', { method: 'POST', ...json({ token, approved }) }),
   getAudit: (limit = 100, event_type = '') =>
     fetchJson<AuditEntry[]>(`/api/policy/audit?limit=${limit}${event_type ? `&event_type=${event_type}` : ''}`),
-  getPolicySettings: () => fetchJson<{ confirmation_strictness: string; shell_enabled: boolean }>('/api/policy/settings'),
+  getPolicySettings: () =>
+    fetchJson<{
+      confirmation_strictness: string;
+      shell_enabled: boolean;
+      approval_mode: string;
+      auto_approve_workspaces: string[];
+      auto_approve_tools: string[];
+      auto_approve_shell_commands: string[];
+    }>('/api/policy/settings'),
 
   // Config
   getConfig: () => fetchJson<Record<string, unknown>>('/api/config'),
   updateConfig: (data: Record<string, unknown>) =>
     fetchJson('/api/config', { method: 'PUT', ...json(data) }),
   getRawYaml: () => fetchJson<{ yaml: string; path: string }>('/api/config/raw'),
+
+  // Admin
+  getLlmProviders: () => fetchJson<LLMProvidersResponse>('/api/admin/llm-providers'),
+  updateLlmProvider: (
+    provider: string,
+    data: {
+      enabled?: boolean;
+      models?: string[];
+      default_model?: string;
+      api_key?: string;
+      set_active?: boolean;
+      active_model?: string;
+    },
+  ) => fetchJson(`/api/admin/llm-providers/${encodeURIComponent(provider)}`, { method: 'PUT', ...json(data) }),
+  updateAgents: (data: { enabled: boolean }) =>
+    fetchJson('/api/admin/agents', { method: 'PUT', ...json(data) }),
+  getMcpServers: () => fetchJson<MCPServersResponse>('/api/admin/mcp-servers'),
+  createMcpServer: (data: Record<string, unknown>) =>
+    fetchJson('/api/admin/mcp-servers', { method: 'POST', ...json(data) }),
+  updateMcpServer: (name: string, data: Record<string, unknown>) =>
+    fetchJson(`/api/admin/mcp-servers/${encodeURIComponent(name)}`, { method: 'PUT', ...json(data) }),
+  deleteMcpServer: (name: string) =>
+    fetchJson(`/api/admin/mcp-servers/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  testMcpServer: (name: string) =>
+    fetchJson<MCPServerTestResponse>(`/api/admin/mcp-servers/${encodeURIComponent(name)}/test`, { method: 'POST' }),
+  getMcpServerMethods: (name: string) =>
+    fetchJson<MCPMethodsResponse>(`/api/admin/mcp-servers/${encodeURIComponent(name)}/methods`),
+
+  // Agent Teams
+  getAgentTeams: (enabledOnly = false) =>
+    fetchJson<AgentTeam[]>(`/api/admin/agent-teams${enabledOnly ? '?enabled_only=true' : ''}`),
+  getAgentTeamSources: () =>
+    fetchJson<{ team_dirs: string[]; install_dir: string }>('/api/admin/agent-teams/sources'),
+  installAgentTeam: (source: string, name?: string) =>
+    fetchJson<Record<string, unknown>>('/api/admin/agent-teams/install', { method: 'POST', ...json({ source, name }) }),
+  uninstallAgentTeam: (teamId: string) =>
+    fetchJson<{ status: string; id: string }>(`/api/admin/agent-teams/install/${encodeURIComponent(teamId)}`, { method: 'DELETE' }),
+  createAgentTeam: (data: AgentTeam) =>
+    fetchJson<AgentTeam>('/api/admin/agent-teams', { method: 'POST', ...json(data) }),
+  updateAgentTeam: (id: string, data: AgentTeam) =>
+    fetchJson<AgentTeam>(`/api/admin/agent-teams/team/${id}`, { method: 'PUT', ...json(data) }),
+  deleteAgentTeam: (id: string) =>
+    fetchJson<{ status: string; id: string }>(`/api/admin/agent-teams/team/${id}`, { method: 'DELETE' }),
+  buildAgentTeamFromPrompt: (prompt: string) =>
+    fetchJson<AgentTeam>('/api/admin/agent-teams/build-from-prompt', { method: 'POST', ...json({ prompt }) }),
+  testAgentTeamRoute: (task: string) =>
+    fetchJson<Record<string, unknown>>('/api/admin/agent-teams/test-route', { method: 'POST', ...json({ task }) }),
+  dryRunAgentTeam: (id: string, task: string) =>
+    fetchJson<Record<string, unknown>>(`/api/admin/agent-teams/team/${id}/dry-run`, { method: 'POST', ...json({ task }) }),
+  getAgentTeamRuns: (limit = 50) =>
+    fetchJson<AgentTeamRun[]>(`/api/admin/agent-teams/runs?limit=${limit}`),
+  getAgentTeamRun: (runId: string) =>
+    fetchJson<Record<string, unknown>>(`/api/admin/agent-teams/runs/${encodeURIComponent(runId)}`),
+
+  // Agent Skills
+  getAgentSkills: (enabledOnly = false) =>
+    fetchJson<AgentSkillItem[]>(`/api/admin/agent-skills${enabledOnly ? '?enabled_only=true' : ''}`),
+  createAgentSkill: (data: Omit<AgentSkillItem, 'id' | 'created_at' | 'updated_at'>) =>
+    fetchJson<AgentSkillItem>('/api/admin/agent-skills', { method: 'POST', ...json(data) }),
+  updateAgentSkill: (id: number, data: Omit<AgentSkillItem, 'id' | 'created_at' | 'updated_at'>) =>
+    fetchJson<AgentSkillItem>(`/api/admin/agent-skills/${id}`, { method: 'PUT', ...json(data) }),
+  deleteAgentSkill: (id: number) =>
+    fetchJson<{ status: string; id: number }>(`/api/admin/agent-skills/${id}`, { method: 'DELETE' }),
 
   // Logs
   getRecentLogs: (lines = 200, level = '') =>

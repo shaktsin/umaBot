@@ -29,10 +29,13 @@ Typical lifecycle::
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
+
+from umabot.tools.shell_env import apply_zsh_path
 
 logger = logging.getLogger("umabot.tools.mcp")
 
@@ -70,9 +73,11 @@ class MCPRegistry:
         # http transport state
         self._http_sessions: Dict[str, Any] = {}  # name -> aiohttp.ClientSession
         self._http_urls: Dict[str, str] = {}       # name -> base url
+        self._http_headers: Dict[str, Dict[str, str]] = {}
 
         # shared
         self._transport: Dict[str, str] = {}       # name -> "stdio" | "http"
+        self._server_cfg: Dict[str, Any] = {}      # name -> MCPServerConfig-like
         self._tools: Dict[str, Dict[str, Any]] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
         self._request_id: int = 0
@@ -97,6 +102,10 @@ class MCPRegistry:
                 logger.error(
                     "Failed to connect MCP server '%s': %s", server.name, exc, exc_info=True
                 )
+                if bool(getattr(server, "required", False)):
+                    raise RuntimeError(
+                        f"Required MCP server '{server.name}' failed to start: {exc}"
+                    ) from exc
 
     async def stop(self) -> None:
         """Shut down all servers gracefully."""
@@ -123,7 +132,9 @@ class MCPRegistry:
         self._processes.clear()
         self._http_sessions.clear()
         self._http_urls.clear()
+        self._http_headers.clear()
         self._transport.clear()
+        self._server_cfg.clear()
         self._tools.clear()
         self._locks.clear()
 
@@ -132,9 +143,21 @@ class MCPRegistry:
     # ------------------------------------------------------------------
 
     async def _start_stdio_server(self, server) -> None:
+        if not getattr(server, "command", ""):
+            raise ValueError(f"MCP stdio server '{server.name}' has no command configured")
+
         cmd = [server.command] + list(getattr(server, "args", []) or [])
         extra_env = getattr(server, "env", {}) or {}
-        env = {**os.environ, **extra_env}
+        env = dict(os.environ)
+        for env_name in list(getattr(server, "env_vars", []) or []):
+            key = str(env_name).strip()
+            if not key:
+                continue
+            if key in os.environ:
+                env[key] = os.environ[key]
+        env.update(extra_env)
+        env = apply_zsh_path(env)
+        cwd = (getattr(server, "cwd", "") or "").strip() or None
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -142,15 +165,18 @@ class MCPRegistry:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            cwd=cwd,
             limit=_STDIO_READ_LIMIT,
         )
+        self._server_cfg[server.name] = server
         self._processes[server.name] = proc
         self._transport[server.name] = "stdio"
         self._locks[server.name] = asyncio.Lock()
         logger.info("Started MCP stdio server '%s' (pid=%d)", server.name, proc.pid)
 
-        await self._initialize(server.name)
-        await self._discover_tools(server.name)
+        startup_timeout = self._startup_timeout(server.name)
+        await self._initialize(server.name, timeout=startup_timeout)
+        await self._discover_tools(server.name, timeout=startup_timeout)
 
     # ------------------------------------------------------------------
     # Internal — http startup
@@ -163,15 +189,19 @@ class MCPRegistry:
         if not url:
             raise ValueError(f"MCP http server '{server.name}' has no url configured")
 
-        session = aiohttp.ClientSession()
+        headers = self._build_http_headers(server)
+        session = aiohttp.ClientSession(headers=headers or None)
+        self._server_cfg[server.name] = server
         self._http_sessions[server.name] = session
         self._http_urls[server.name] = url
+        self._http_headers[server.name] = headers
         self._transport[server.name] = "http"
         self._locks[server.name] = asyncio.Lock()
         logger.info("Connecting to MCP http server '%s' at %s", server.name, url)
 
-        await self._initialize(server.name)
-        await self._discover_tools(server.name)
+        startup_timeout = self._startup_timeout(server.name)
+        await self._initialize(server.name, timeout=startup_timeout)
+        await self._discover_tools(server.name, timeout=startup_timeout)
 
     # ------------------------------------------------------------------
     # Internal — stdio JSON-RPC primitives
@@ -233,7 +263,10 @@ class MCPRegistry:
         async with session.post(
             url,
             json=message,
-            headers={"Accept": "application/json, text/event-stream"},
+            headers=self._request_headers(
+                server_name,
+                {"Accept": "application/json, text/event-stream"},
+            ),
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as resp:
             resp.raise_for_status()
@@ -294,7 +327,10 @@ class MCPRegistry:
             msg["params"] = params
         try:
             async with session.post(
-                url, json=msg, timeout=aiohttp.ClientTimeout(total=10.0)
+                url,
+                json=msg,
+                headers=self._request_headers(server_name),
+                timeout=aiohttp.ClientTimeout(total=10.0),
             ) as resp:
                 pass  # 202 Accepted or similar — we don't need the body
         except Exception as exc:
@@ -336,7 +372,7 @@ class MCPRegistry:
     # Internal — MCP handshake + tool discovery (transport-agnostic)
     # ------------------------------------------------------------------
 
-    async def _initialize(self, server_name: str) -> None:
+    async def _initialize(self, server_name: str, timeout: float = 15.0) -> None:
         result = await self._rpc(
             server_name,
             "initialize",
@@ -345,7 +381,7 @@ class MCPRegistry:
                 "capabilities": {},
                 "clientInfo": {"name": "umabot", "version": "1.0.0"},
             },
-            timeout=15.0,
+            timeout=timeout,
         )
         info = (result or {}).get("serverInfo", {})
         logger.info(
@@ -354,11 +390,14 @@ class MCPRegistry:
         )
         await self._notify(server_name, "notifications/initialized")
 
-    async def _discover_tools(self, server_name: str) -> None:
-        result = await self._rpc(server_name, "tools/list", {})
+    async def _discover_tools(self, server_name: str, timeout: float = 30.0) -> None:
+        result = await self._rpc(server_name, "tools/list", {}, timeout=timeout)
         tools: List[Dict] = (result or {}).get("tools", [])
         for tool in tools:
             original_name = tool["name"]
+            if not self._is_tool_enabled(server_name, original_name):
+                logger.info("MCP '%s': filtered tool '%s' by config", server_name, original_name)
+                continue
             prefixed = f"mcp_{server_name}_{original_name}"
             self._tools[prefixed] = {
                 "server": server_name,
@@ -405,6 +444,79 @@ class MCPRegistry:
             server_name,
             "tools/call",
             {"name": tool_info["tool"], "arguments": arguments},
-            timeout=60.0,
+            timeout=self._tool_timeout(server_name),
         )
         return (result or {}).get("content", [])
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _server(self, server_name: str) -> Any:
+        return self._server_cfg.get(server_name)
+
+    def _startup_timeout(self, server_name: str) -> float:
+        server = self._server(server_name)
+        timeout = float(getattr(server, "startup_timeout_sec", 10.0) or 10.0)
+        return timeout if timeout > 0 else 10.0
+
+    def _tool_timeout(self, server_name: str) -> float:
+        server = self._server(server_name)
+        timeout = float(getattr(server, "tool_timeout_sec", 60.0) or 60.0)
+        return timeout if timeout > 0 else 60.0
+
+    def _request_headers(
+        self,
+        server_name: str,
+        extra: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        headers = dict(self._http_headers.get(server_name, {}))
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _build_http_headers(self, server: Any) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        static = getattr(server, "http_headers", {}) or {}
+        if isinstance(static, dict):
+            for key, value in static.items():
+                k = str(key).strip()
+                if not k:
+                    continue
+                headers[k] = str(value)
+
+        env_headers = getattr(server, "env_http_headers", {}) or {}
+        if isinstance(env_headers, dict):
+            for header_name, env_var_name in env_headers.items():
+                k = str(header_name).strip()
+                env_name = str(env_var_name).strip()
+                if not k or not env_name:
+                    continue
+                env_value = os.environ.get(env_name)
+                if env_value:
+                    headers[k] = env_value
+
+        bearer_env = str(getattr(server, "bearer_token_env_var", "") or "").strip()
+        if bearer_env and "Authorization" not in headers:
+            token = os.environ.get(bearer_env)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+        return headers
+
+    def _is_tool_enabled(self, server_name: str, tool_name: str) -> bool:
+        server = self._server(server_name)
+        enabled = getattr(server, "enabled_tools", []) or []
+        disabled = getattr(server, "disabled_tools", []) or []
+
+        enabled_patterns = [str(v).strip() for v in enabled if str(v).strip()]
+        disabled_patterns = [str(v).strip() for v in disabled if str(v).strip()]
+
+        if enabled_patterns:
+            allowed = any(fnmatch.fnmatch(tool_name, pat) for pat in enabled_patterns)
+            if not allowed:
+                return False
+
+        if disabled_patterns and any(fnmatch.fnmatch(tool_name, pat) for pat in disabled_patterns):
+            return False
+        return True

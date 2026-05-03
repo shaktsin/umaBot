@@ -60,7 +60,7 @@ help: ## Show this help
 	@echo ""
 	@echo "$(GREEN)Control Panel$(NC)"
 	@echo "  $(YELLOW)panel$(NC)         Start web control panel (installs deps, opens browser)"
-	@echo "  $(YELLOW)panel-build$(NC)   Build React frontend → umabot/controlpanel/static/"
+	@echo "  $(YELLOW)panel-build$(NC)   Build frontend → umabot/controlpanel/static/"
 	@echo "  $(YELLOW)panel-dev$(NC)     Start frontend HMR dev server (needs 'make run' on :8080)"
 	@echo ""
 	@echo "$(GREEN)Skills$(NC)"
@@ -88,7 +88,7 @@ help: ## Show this help
 	@echo "  $(YELLOW)clean$(NC)         Nuke everything: .venv + ~/.umabot/ + sessions  →  clean slate"
 	@echo ""
 	@echo "$(GREEN)Release$(NC)"
-	@echo "  $(YELLOW)build$(NC)         Build dist packages"
+	@echo "  $(YELLOW)build$(NC)         Build frontend + dist packages"
 	@echo "  $(YELLOW)publish-test$(NC)  Upload to TestPyPI"
 	@echo "  $(YELLOW)publish$(NC)       Upload to PyPI"
 	@echo "  $(YELLOW)info$(NC)          Show system/path information"
@@ -215,7 +215,7 @@ panel: $(INSTALL_STAMP) ## Start web control panel (installs deps, opens browser
 	@$(PIP) install --quiet -e ".[panel]"
 	@$(UMABOT) panel --config $(CONFIG_FILE) --log-level $(LOG_LEVEL)
 
-panel-build: ## Build React frontend → umabot/controlpanel/static/
+panel-build: ## Build frontend → umabot/controlpanel/static/
 	@echo "$(BLUE)Building frontend...$(NC)"
 	@cd umabot/controlpanel/frontend && npm install && npm run build
 	@echo "$(GREEN)✓ Built → umabot/controlpanel/static/$(NC)"
@@ -320,7 +320,7 @@ clean: stop ## Nuke everything: .venv + ~/.umabot/ + sessions + build artifacts
 # Release
 # ---------------------------------------------------------------------------
 
-build: ## Build distribution packages (wheel + sdist)
+build: panel-build ## Build frontend + distribution packages (wheel + sdist)
 	@echo "$(BLUE)Building...$(NC)"
 	@$(BIN)/python -m build
 	@echo "$(GREEN)✓ Built → dist/$(NC)"

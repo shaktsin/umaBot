@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 from aiohttp import web
+
+logger = logging.getLogger(__name__)
+
+_WS_SEND_TIMEOUT = 5.0  # seconds; prevents slow/stale clients from blocking the hub lock
 
 
 @dataclass
@@ -52,11 +57,16 @@ class ChannelHub:
             client = next((c for c in bucket.values() if c.connector == connector), None)
             if not client:
                 return False
-            payload: dict = {"type": "send", "chat_id": chat_id, "text": text}
-            if attachments:
-                payload["attachments"] = attachments
-            await client.ws.send_json(payload)
-            return True
+        # Send outside the lock so a slow/stale client cannot hold it indefinitely.
+        payload: dict = {"type": "send", "chat_id": chat_id, "text": text}
+        if attachments:
+            payload["attachments"] = attachments
+        try:
+            await asyncio.wait_for(client.ws.send_json(payload), timeout=_WS_SEND_TIMEOUT)
+        except Exception as exc:
+            logger.debug("send failed connector=%s: %s", connector, exc)
+            return False
+        return True
 
     async def send_payload(self, channel: str, connector: str, chat_id: str, payload: dict) -> bool:
         """Send an arbitrary JSON payload to a specific connector.
@@ -72,8 +82,16 @@ class ChannelHub:
             client = next((c for c in bucket.values() if c.connector == connector), None)
             if not client:
                 return False
-            await client.ws.send_json({**payload, "chat_id": chat_id})
-            return True
+        # Send outside the lock so a slow/stale client cannot hold it indefinitely.
+        try:
+            await asyncio.wait_for(
+                client.ws.send_json({**payload, "chat_id": chat_id}),
+                timeout=_WS_SEND_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.debug("send_payload failed connector=%s: %s", connector, exc)
+            return False
+        return True
 
     async def has_channel(self, channel: str) -> bool:
         async with self._lock:

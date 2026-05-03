@@ -8,7 +8,14 @@
 
   let pending = $state<PendingConfirmation[]>([]);
   let audit = $state<AuditEntry[]>([]);
-  let settings = $state<{ confirmation_strictness: string; shell_enabled: boolean } | null>(null);
+  let settings = $state<{
+    confirmation_strictness: string;
+    shell_enabled: boolean;
+    approval_mode: string;
+    auto_approve_workspaces: string[];
+    auto_approve_tools: string[];
+    auto_approve_shell_commands: string[];
+  } | null>(null);
   let loading = $state(true);
   let confirming = $state<string | null>(null);
 
@@ -69,6 +76,12 @@
         <span class="label">Shell tools</span>
         <Badge variant={settings.shell_enabled ? 'warning' : 'default'}>
           {settings.shell_enabled ? 'enabled' : 'disabled'}
+        </Badge>
+      </div>
+      <div class="flex items-center gap-2">
+        <span class="label">Approval mode</span>
+        <Badge variant={settings.approval_mode === 'auto_approve_workspace' ? 'warning' : 'default'}>
+          {settings.approval_mode}
         </Badge>
       </div>
     </div>

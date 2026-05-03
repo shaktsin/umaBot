@@ -1,4 +1,15 @@
-export type PanelId = 'dashboard' | 'chat' | 'connectors' | 'skills' | 'tasks' | 'policy' | 'config' | 'logs';
+export type PanelId =
+  | 'dashboard'
+  | 'chat'
+  | 'connectors'
+  | 'skills'
+  | 'tasks'
+  | 'agent_teams'
+  | 'policy'
+  | 'providers'
+  | 'mcp'
+  | 'config'
+  | 'logs';
 
 class AppStore {
   activePanel = $state<PanelId>('dashboard');

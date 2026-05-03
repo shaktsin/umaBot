@@ -1,11 +1,19 @@
 import type { Attachment, PendingConfirmation } from '$lib/types';
 import { appStore } from '$lib/stores/app.svelte';
 import { chatStore } from '$lib/stores/chat.svelte';
+import { multiAgentStore } from '$lib/stores/multiAgent.svelte';
 
 type WsEvent =
   | { type: 'chat'; role: string; content: string; chat_id: string; attachments?: Attachment[] }
-  | { type: 'event'; name: string; data: Record<string, unknown> }
+  | { type: 'event'; name: string; data: unknown }
   | { type: 'ping' };
+
+function asRecord(data: unknown): Record<string, unknown> {
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    return data as Record<string, unknown>;
+  }
+  return {};
+}
 
 class WsStore {
   connected = $state(false);
@@ -61,14 +69,22 @@ class WsStore {
     }
 
     if (msg.type === 'event') {
+      if (
+        msg.name.startsWith('multi_agent_') ||
+        msg.name.startsWith('team.')
+      ) {
+        multiAgentStore.handleEvent(msg.name, msg.data);
+        return;
+      }
+      const data = asRecord(msg.data);
       if (msg.name === 'gateway_status') {
-        appStore.gatewayConnected = !!(msg.data as { connected: boolean }).connected;
+        appStore.gatewayConnected = !!data.connected;
       } else if (msg.name === 'pending_confirmation') {
-        const confirm = msg.data as unknown as PendingConfirmation;
+        const confirm = data as unknown as PendingConfirmation;
         this.pendingConfirmations = [...this.pendingConfirmations, confirm];
         appStore.pendingCount = this.pendingConfirmations.length;
       } else if (msg.name === 'confirmation_resolved') {
-        const { token } = msg.data as { token: string };
+        const { token } = data as { token: string };
         this.pendingConfirmations = this.pendingConfirmations.filter((c) => c.token !== token);
         appStore.pendingCount = this.pendingConfirmations.length;
       }

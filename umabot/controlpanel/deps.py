@@ -36,3 +36,7 @@ def get_connector(request: HTTPConnection) -> GatewayConnector:
 
 def get_skill_registry(request: HTTPConnection):
     return request.app.state.skill_registry
+
+
+def get_tool_registry(request: HTTPConnection):
+    return request.app.state.tool_registry

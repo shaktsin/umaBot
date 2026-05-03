@@ -23,6 +23,8 @@ logger = logging.getLogger("umabot.agents.agent")
 class AgentRunResult:
     content: str
     attachments: List[Attachment] = field(default_factory=list)
+    truncated: bool = False
+    failed: bool = False
 
 
 class SpawnedAgent:
@@ -39,6 +41,7 @@ class SpawnedAgent:
         max_iterations: Maximum LLM→tool cycles before forcing a final answer.
         on_tool_call: Optional async callback invoked *before* each tool call;
                       receives (tool_name, arguments) and may raise to block the call.
+        on_event: Optional async callback for structured agent telemetry.
     """
 
     def __init__(
@@ -53,6 +56,10 @@ class SpawnedAgent:
         tool_registry,
         max_iterations: int = 15,
         on_tool_call: Optional[Callable] = None,
+        on_event: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+        run_id: str = "",
+        agent_id: str = "",
+        parent_agent_id: str = "",
     ) -> None:
         self.role = role
         self.objective = objective
@@ -63,6 +70,10 @@ class SpawnedAgent:
         self.tool_registry = tool_registry
         self.max_iterations = max_iterations
         self.on_tool_call = on_tool_call
+        self.on_event = on_event
+        self.run_id = run_id
+        self.agent_id = agent_id
+        self.parent_agent_id = parent_agent_id
 
     async def run(self) -> AgentRunResult:
         """Execute the agent loop and return final text + tool attachments."""
@@ -77,6 +88,8 @@ class SpawnedAgent:
         collected_attachments: List[Attachment] = []
 
         tools_spec = self._build_tools_spec()
+        await self._emit_status("running")
+        await self._emit_log("agent.started", f"{self.role} started")
         logger.info(
             "Agent starting role=%s tools=%d max_iter=%d",
             self.role,
@@ -85,6 +98,11 @@ class SpawnedAgent:
         )
 
         for iteration in range(self.max_iterations):
+            await self._emit_log(
+                "agent.iteration",
+                f"Iteration {iteration + 1} running",
+                payload={"iteration": iteration + 1},
+            )
             # Keep system + first user message, then only the last 6 messages
             # to prevent conversation history from growing unboundedly and hitting rate limits.
             trimmed = _trim_messages(messages, keep_head=2, keep_tail=6)
@@ -102,6 +120,8 @@ class SpawnedAgent:
 
             if not response.tool_calls:
                 # Agent is done
+                await self._emit_status("completed")
+                await self._emit_log("agent.completed", f"{self.role} completed")
                 return AgentRunResult(
                     content=response.content or "",
                     attachments=collected_attachments,
@@ -122,15 +142,34 @@ class SpawnedAgent:
                     tool_message["tool_call_id"] = tool_call.id
                 messages.append(tool_message)
 
-        # Max iterations reached — force a final answer without tools
+        # Max iterations reached — force a final answer without tools.
+        # Mark result as truncated so callers (orchestrator, chain) can detect
+        # incomplete work and retry or escalate rather than silently accepting it.
         logger.warning("Agent role=%s reached max_iterations=%d, forcing final answer", self.role, self.max_iterations)
+        await self._emit_status("truncated")
+        await self._emit_log(
+            "agent.truncated",
+            f"{self.role} reached max iterations ({self.max_iterations}) — work may be incomplete",
+            payload={"max_iterations": self.max_iterations},
+        )
         final = await self.llm_client.generate(messages, tools=None)
+        base_content = final.content or f"[{self.role}] reached iteration limit without completing the objective."
+        truncation_note = (
+            f"\n\n[AGENT_TRUNCATED: role={self.role!r} hit max_iterations={self.max_iterations}. "
+            "Work may be incomplete. Orchestrator should retry or extend the budget.]"
+        )
         return AgentRunResult(
-            content=final.content or f"[{self.role}] reached iteration limit without completing the objective.",
+            content=base_content + truncation_note,
             attachments=collected_attachments,
+            truncated=True,
         )
 
     async def _execute_tool(self, name: str, arguments: Dict[str, Any]) -> ToolResult:
+        await self._emit_log(
+            "agent.tool.call",
+            f"Calling tool {name}",
+            payload={"tool": name, "arguments": arguments},
+        )
         if self.on_tool_call:
             try:
                 await self.on_tool_call(name, arguments)
@@ -140,12 +179,74 @@ class SpawnedAgent:
         tool = self.tool_registry.get(name)
         if not tool:
             logger.warning("Agent role=%s requested unknown tool=%s", self.role, name)
+            await self._emit_log("agent.tool.missing", f"Tool '{name}' not found")
             return ToolResult(content=f"Tool '{name}' not found.")
         try:
-            return await tool.handler(arguments)
+            result = await tool.handler(arguments)
+            telemetry: Dict[str, Any] = {"tool": name, "content_len": len(result.content or "")}
+            preview = (result.content or "").strip()
+            if preview:
+                telemetry["content_preview"] = preview[:240]
+            if isinstance(result.data, dict):
+                # Keep telemetry small and structured for retry diagnostics.
+                for key in ("cmd", "cwd", "exit_code", "timed_out"):
+                    if key in result.data:
+                        telemetry[key] = result.data.get(key)
+            await self._emit_log(
+                "agent.tool.result",
+                f"Tool {name} returned",
+                payload=telemetry,
+            )
+            return result
         except Exception as exc:
             logger.exception("Agent role=%s tool=%s failed", self.role, name)
+            await self._emit_log(
+                "agent.tool.error",
+                f"Tool '{name}' failed: {exc}",
+                payload={"tool": name, "error": str(exc)},
+            )
             return ToolResult(content=f"Tool '{name}' failed: {exc}")
+
+    async def _emit_status(self, status: str) -> None:
+        if not self.on_event:
+            return
+        try:
+            await self.on_event(
+                "multi_agent_node_status",
+                {
+                    "run_id": self.run_id,
+                    "node_id": self.agent_id,
+                    "parent_node_id": self.parent_agent_id,
+                    "role": self.role,
+                    "status": status,
+                },
+            )
+        except Exception:
+            pass
+
+    async def _emit_log(
+        self,
+        event_type: str,
+        message: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self.on_event:
+            return
+        try:
+            await self.on_event(
+                "multi_agent_node_log",
+                {
+                    "run_id": self.run_id,
+                    "node_id": self.agent_id,
+                    "parent_node_id": self.parent_agent_id,
+                    "role": self.role,
+                    "event_type": event_type,
+                    "message": message,
+                    "payload": payload or {},
+                },
+            )
+        except Exception:
+            pass
 
     def _build_tools_spec(self) -> List[Dict[str, Any]]:
         specs = []

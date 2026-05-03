@@ -6,7 +6,10 @@
   import Connectors from '$lib/components/panels/Connectors.svelte';
   import Skills from '$lib/components/panels/Skills.svelte';
   import Tasks from '$lib/components/panels/Tasks.svelte';
+  import AgentTeams from '$lib/components/panels/AgentTeams.svelte';
   import Policy from '$lib/components/panels/Policy.svelte';
+  import LLMProviders from '$lib/components/panels/LLMProviders.svelte';
+  import MCPServers from '$lib/components/panels/MCPServers.svelte';
   import ConfigEditor from '$lib/components/panels/ConfigEditor.svelte';
   import Logs from '$lib/components/panels/Logs.svelte';
   import { appStore } from '$lib/stores/app.svelte';
@@ -34,6 +37,12 @@
           <Skills />
         {:else if appStore.activePanel === 'tasks'}
           <Tasks />
+        {:else if appStore.activePanel === 'agent_teams'}
+          <AgentTeams />
+        {:else if appStore.activePanel === 'providers'}
+          <LLMProviders />
+        {:else if appStore.activePanel === 'mcp'}
+          <MCPServers />
         {:else if appStore.activePanel === 'policy'}
           <Policy />
         {:else if appStore.activePanel === 'config'}
