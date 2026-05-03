@@ -14,7 +14,14 @@ import yaml
 
 from dataclasses import asdict
 
-from .schema import Config, PolicyRuleConfig, SkillRuntimeOverride, SkillsConfig, default_config
+from .schema import (
+    Config,
+    LLMProviderConfig,
+    PolicyRuleConfig,
+    SkillRuntimeOverride,
+    SkillsConfig,
+    default_config,
+)
 
 
 logger = logging.getLogger("umabot.config")
@@ -41,6 +48,7 @@ ENV_MAP = {
     "UMABOT_WHATSAPP_ENABLED": ("whatsapp", "enabled"),
     "UMABOT_SHELL_TOOL": ("tools", "shell_enabled"),
     "UMABOT_CONFIRMATION_STRICTNESS": ("policy", "confirmation_strictness"),
+    "UMABOT_APPROVAL_MODE": ("policy", "approval_mode"),
     "UMABOT_DB_PATH": ("storage", "db_path"),
     "UMABOT_VAULT_DIR": ("storage", "vault_dir"),
     "UMABOT_PID_FILE": ("runtime", "pid_file"),
@@ -196,6 +204,18 @@ def store_secrets(
         _store_keychain_secret("UMABOT_GOOGLE_CLIENT_SECRET", google_client_secret)
 
 
+def store_provider_api_key(provider: str, api_key: str) -> None:
+    """Persist provider-specific LLM API key to Keychain/.env fallback."""
+    provider = (provider or "").strip().lower()
+    if not provider or not api_key:
+        return
+    env_key = _provider_secret_env_key(provider)
+    if platform.system() == "Darwin":
+        if _store_keychain_secret(env_key, api_key):
+            return
+    _upsert_env_secret(env_key, api_key)
+
+
 def run_wizard(config_path: Optional[str] = None) -> str:
     print("UMA BOT setup wizard")
     provider = _prompt_choice(
@@ -341,6 +361,17 @@ def _apply_env_map(cfg: Config, env: Dict[str, Any]) -> None:
         if env_key in env and env[env_key]:
             setattr(cfg.integrations.google, attr, env[env_key])
 
+    # Provider-specific LLM keys:
+    # UMABOT_LLM_<PROVIDER>_API_KEY (e.g. UMABOT_LLM_OPENAI_API_KEY)
+    providers = getattr(cfg, "llm_providers", {}) or {}
+    if isinstance(providers, dict):
+        for provider_name, provider_cfg in providers.items():
+            if not isinstance(provider_cfg, LLMProviderConfig):
+                continue
+            env_key = _provider_secret_env_key(str(provider_name))
+            if env_key in env and env[env_key]:
+                provider_cfg.api_key = str(env[env_key])
+
 
 def _apply_overrides(cfg: Config, overrides: Dict[str, Any]) -> None:
     for key, value in overrides.items():
@@ -383,6 +414,18 @@ def _update_dataclass(dc: Any, data: Dict[str, Any]) -> None:
         current = getattr(dc, key)
         if is_dataclass(current) and isinstance(value, dict):
             _update_dataclass(current, value)
+        elif isinstance(current, dict) and isinstance(value, dict):
+            value_type = _dict_value_type(hints.get(key))
+            if value_type and is_dataclass(value_type):
+                merged = dict(current)
+                for item_key, item_value in value.items():
+                    if isinstance(item_value, dict):
+                        merged[item_key] = _dataclass_from_dict(value_type, item_value)
+                    else:
+                        merged[item_key] = item_value
+                setattr(dc, key, merged)
+            else:
+                setattr(dc, key, value)
         elif isinstance(current, list) and isinstance(value, list):
             elem_type = _list_element_type(hints.get(key))
             if elem_type and is_dataclass(elem_type):
@@ -409,6 +452,18 @@ def _list_element_type(hint: Any) -> Any:
         args = getattr(hint, "__args__", ())
         if args:
             return args[0]
+    return None
+
+
+def _dict_value_type(hint: Any) -> Any:
+    """Extract V from Dict[K, V], or None if not a generic dict hint."""
+    if hint is None:
+        return None
+    origin = getattr(hint, "__origin__", None)
+    if origin is dict:
+        args = getattr(hint, "__args__", ())
+        if len(args) == 2:
+            return args[1]
     return None
 
 
@@ -479,6 +534,10 @@ def _strip_secrets(data: Dict[str, Any]) -> None:
     # Remove secrets before writing config.yaml
     if "llm" in data and isinstance(data["llm"], dict):
         data["llm"]["api_key"] = None
+    if "llm_providers" in data and isinstance(data["llm_providers"], dict):
+        for provider in data["llm_providers"].values():
+            if isinstance(provider, dict):
+                provider["api_key"] = None
     # DEPRECATED: Old telegram/discord/whatsapp sections (kept for backward compat)
     for channel in ("telegram", "discord", "whatsapp"):
         if channel in data and isinstance(data[channel], dict):
@@ -536,6 +595,17 @@ def _store_env_secrets(api_key: str, telegram_token: str, discord_token: str) ->
     os.chmod(env_path, 0o600)
 
 
+def _upsert_env_secret(key: str, value: str) -> None:
+    env_path = DEFAULT_ENV_PATHS[-1]
+    env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(env_path.parent, 0o700)
+    current = _read_dotenv(env_path)
+    current[key] = value
+    lines = [f"{k}={v}" for k, v in sorted(current.items())]
+    env_path.write_text("\n".join(lines) + "\n")
+    os.chmod(env_path, 0o600)
+
+
 def _store_keychain_secret(account: str, secret: str) -> bool:
     try:
         subprocess.run(
@@ -575,6 +645,18 @@ def _load_keychain_secrets(cfg: Config) -> None:
         if debug and google.client_secret:
             logger.info("Keychain UMABOT_GOOGLE_CLIENT_SECRET loaded")
 
+    providers = getattr(cfg, "llm_providers", {}) or {}
+    if isinstance(providers, dict):
+        for provider_name, provider_cfg in providers.items():
+            if not isinstance(provider_cfg, LLMProviderConfig):
+                continue
+            if provider_cfg.api_key:
+                continue
+            provider_key = _provider_secret_env_key(str(provider_name))
+            provider_cfg.api_key = _read_keychain_secret(provider_key)
+            if debug and provider_cfg.api_key:
+                logger.info("Keychain %s loaded", provider_key)
+
 
 def _read_keychain_secret(account: str) -> Optional[str]:
     try:
@@ -597,3 +679,8 @@ def _debug_secrets_enabled() -> bool:
         "y",
         "on",
     }
+
+
+def _provider_secret_env_key(provider: str) -> str:
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in provider.upper()).strip("_")
+    return f"UMABOT_LLM_{normalized}_API_KEY"

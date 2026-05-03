@@ -90,6 +90,7 @@ class Gateway:
             send_message=self.send_message,
             send_control_message=self.send_control_message,
             send_confirmation_request=self.send_confirmation_request,
+            send_control_observability_event=self.send_control_observability_event,
         )
         self._scheduler = TaskScheduler(db=db, queue=queue)
 
@@ -152,6 +153,7 @@ class Gateway:
             send_message=self.send_message,
             send_control_message=self.send_control_message,
             send_confirmation_request=self.send_confirmation_request,
+            send_control_observability_event=self.send_control_observability_event,
         )
         await self._worker.start()
         await self._scheduler.start()
@@ -220,6 +222,33 @@ class Gateway:
         # Final fallback: send to original channel
         await self.send_message(fallback_channel, fallback_chat_id, text)
 
+    async def send_control_observability_event(self, event_name: str, data: Dict, summary_text: str = "") -> None:
+        """Send telemetry events to admin panels with per-panel visibility filtering."""
+        category, detail = _observability_event_policy(event_name)
+        if self._control_panel.panels:
+            await self._control_panel.send_observability_event(
+                event_name=event_name,
+                data=data,
+                summary_text=summary_text,
+                category=category,
+                detail_level=detail,
+            )
+            return
+        # Legacy fallback: if no panel manager is configured, send summary text only.
+        if summary_text:
+            await self.send_control_message("web", "admin", summary_text)
+
+    async def send_panel_event(self, event_name: str, data: Dict, chat_id: str = "admin") -> None:
+        """Push a structured event payload to the web control panel connector."""
+        sent = await self._hub.send_payload(
+            "web",
+            "web-panel",
+            chat_id,
+            {"type": "panel_event", "name": event_name, "data": data},
+        )
+        if not sent:
+            logger.debug("No web panel connector online for panel event '%s'", event_name)
+
     async def _on_message(self, message) -> None:
         routed = self._router.route(message)
         if routed.kind == "control":
@@ -269,6 +298,20 @@ class Gateway:
         )
 
     async def _on_ws_event(self, connector: str, channel: str, mode: str, data: dict) -> None:
+        # Handle agent approval resolutions sent from the control panel
+        text = str(data.get("text", ""))
+        if text.startswith("AGENT_APPROVE:") or text.startswith("AGENT_DENY:"):
+            parts = text.split(":", 1)
+            approved = parts[0] == "AGENT_APPROVE"
+            token = parts[1] if len(parts) > 1 else ""
+            if token:
+                await self.queue.enqueue(
+                    "admin",
+                    channel,
+                    {"type": "agent_approve", "token": token, "approved": approved},
+                )
+            return
+
         # Optional cross-connector reply routing (used by e.g. gmail_watch connector)
         reply_connector = str(data.get("reply_connector", ""))
         reply_chat_id = str(data.get("reply_chat_id", ""))
@@ -565,6 +608,18 @@ def _mcp_content_to_tool_result(tool_name: str, content: List[Dict]) -> ToolResu
         data={"mcp_content": content},
         attachments=attachments,
     )
+
+
+def _observability_event_policy(event_name: str) -> tuple[str, str]:
+    """Map telemetry event name -> (category, required detail level)."""
+    name = (event_name or "").strip().lower()
+    if name == "multi_agent_node_log":
+        return ("multi_agent_logs", "full")
+    if name.startswith("team.") and ("denied" in name or "failed" in name):
+        return ("multi_agent_logs", "summary")
+    if name == "multi_agent_approval_requested":
+        return ("multi_agent_topology", "none")  # always deliver — user must see this
+    return ("multi_agent_topology", "summary")
 
 
 def _apply_worker_path(config) -> None:

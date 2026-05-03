@@ -6,7 +6,7 @@ import json
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from umabot.controlpanel.connector import GatewayConnector
 from umabot.controlpanel.deps import get_broadcaster, get_config, get_connector, get_db, get_store
@@ -25,6 +25,10 @@ class ConfirmRequest(BaseModel):
 class PolicySettingsRequest(BaseModel):
     confirmation_strictness: str  # normal | strict
     shell_enabled: bool
+    approval_mode: str = "normal"
+    auto_approve_workspaces: List[str] = Field(default_factory=list)
+    auto_approve_tools: List[str] = Field(default_factory=list)
+    auto_approve_shell_commands: List[str] = Field(default_factory=list)
 
 
 @router.get("/pending")
@@ -66,6 +70,21 @@ async def confirm_action(
     return {"status": "approved" if req.approved else "denied", "token": req.token}
 
 
+@router.post("/agents/approve")
+async def approve_agent_action(
+    req: ConfirmRequest,
+    connector: GatewayConnector = Depends(get_connector),
+    broadcaster: EventBroadcaster = Depends(get_broadcaster),
+) -> Dict[str, Any]:
+    """Approve or deny a pending orchestrator approval request."""
+    await connector.send_agent_approval(req.token, req.approved)
+    await broadcaster.broadcast_event(
+        "multi_agent_approval_resolved",
+        {"token": req.token, "approved": req.approved},
+    )
+    return {"status": "approved" if req.approved else "denied", "token": req.token}
+
+
 @router.get("/audit")
 async def get_audit_log(
     db: Database = Depends(get_db),
@@ -96,7 +115,14 @@ async def get_audit_log(
 
 @router.get("/settings")
 async def get_policy_settings(config=Depends(get_config)) -> Dict[str, Any]:
+    policy = getattr(config, "policy", None)
     return {
         "confirmation_strictness": config.policy.confirmation_strictness,
         "shell_enabled": config.tools.shell_enabled,
+        "approval_mode": str(getattr(policy, "approval_mode", "normal") or "normal"),
+        "auto_approve_workspaces": list(getattr(policy, "auto_approve_workspaces", []) or []),
+        "auto_approve_tools": list(getattr(policy, "auto_approve_tools", []) or []),
+        "auto_approve_shell_commands": list(
+            getattr(policy, "auto_approve_shell_commands", []) or []
+        ),
     }

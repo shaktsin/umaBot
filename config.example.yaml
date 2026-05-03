@@ -25,6 +25,9 @@ control_panel:
   chat_id: "123456789"       # your Telegram user/group ID
   web_host: 127.0.0.1
   web_port: 8080
+  observability:
+    multi_agent_topology: summary   # none | summary | full
+    multi_agent_logs: none          # none | summary | full
 
 # Additional panels — all enabled panels receive every notification at once
 control_panels:
@@ -34,6 +37,9 @@ control_panels:
     chat_id: null
     web_host: 127.0.0.1
     web_port: 8080
+    observability:
+      multi_agent_topology: full
+      multi_agent_logs: full
 
 # ---------------------------------------------------------------------------
 # Message Connectors — channels the bot listens and replies on
@@ -179,6 +185,21 @@ agents:
   tokens_per_minute: 0            # 0 = unlimited; set to your API tier limit
 
 # ---------------------------------------------------------------------------
+# Reusable agent teams (optional, layered on top of agents.enabled)
+# ---------------------------------------------------------------------------
+agent_teams:
+  enabled: false
+  routing_mode: hybrid                 # rule | llm | hybrid
+  default_confidence_threshold: 0.62
+  fallback_to_dynamic: true
+  max_teams_considered: 20
+  fit_gate_enabled: true
+  fit_min_query_len: 60
+  install_dir: ~/.umabot/agent-teams  # writable team-pack install/create location
+  team_dirs:
+    - ./agent_teams                    # repo-local team packs (TEAM.md per subdir)
+
+# ---------------------------------------------------------------------------
 # Integrations — external services the bot can act on via built-in tools
 # ---------------------------------------------------------------------------
 integrations:
@@ -221,6 +242,13 @@ security:
 # ---------------------------------------------------------------------------
 policy:
   confirmation_strictness: normal  # normal (RED only) | strict (all tools)
+  # normal | auto_approve_workspace
+  # auto_approve_workspace skips admin confirmation for eligible tool calls
+  # in allowed workspaces.
+  approval_mode: normal
+  auto_approve_workspaces: []       # workspace names, e.g. ["websites", "projects"]
+  auto_approve_tools: []            # tool names/globs, e.g. ["file.*", "shell.run"]
+  auto_approve_shell_commands: []   # safe command prefixes, e.g. ["npm run", "pytest", "git status"]
   # Optional external rule file (recommended for non-trivial ACL policy).
   # Relative paths resolve from config.yaml directory.
   rules_file: ~/.umabot/policies/default.yaml

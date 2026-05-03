@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .registry import RISK_RED, RISK_YELLOW, Tool, ToolRegistry, ToolResult
+from .shell_env import apply_zsh_path, merge_path_segments
 
 # Per-job skill environment.  The worker sets this before executing any tool
 # that was requested while a skill is active.  shell.run reads it and passes
@@ -211,14 +212,28 @@ async def _shell_run(args: Dict[str, Any]) -> ToolResult:
         return ToolResult(content="No command provided.")
     cmd = cmd.replace("\x00", "")
 
+    import os as _os
     skill_env = _active_skill_env.get()
+    env = dict(_os.environ)
+    if skill_env is not None:
+        env.update(skill_env)
+        # Always keep base PATH segments reachable when a skill sets a custom PATH.
+        env["PATH"] = merge_path_segments(skill_env.get("PATH", ""), _os.environ.get("PATH", ""))
+    # Also layer in PATH discovered from login zsh so npm/npx from ~/.zshrc are available.
+    env = apply_zsh_path(env)
     ws = get_active_workspace()
 
     # Resolve cwd: explicit arg > active workspace > None (inherit process cwd)
     explicit_cwd = (args.get("cwd") or "").strip() or None
     cwd: Optional[str] = None
     if explicit_cwd:
-        cwd = str(Path(explicit_cwd).expanduser().resolve())
+        candidate = Path(explicit_cwd).expanduser()
+        if not candidate.is_absolute() and ws:
+            # Relative paths are always anchored to the active workspace root,
+            # never to the gateway process CWD (which is the umabot source dir).
+            candidate = Path(ws.path).expanduser().resolve() / candidate
+        cwd = str(candidate.resolve())
+        Path(cwd).mkdir(parents=True, exist_ok=True)
     elif ws:
         if not ws.acl.shell:
             return ToolResult(
@@ -237,17 +252,34 @@ async def _shell_run(args: Dict[str, Any]) -> ToolResult:
             shell=True,
             executable="/bin/bash",
             capture_output=True,
-            text=True,
             timeout=60,
             check=False,
-            env=skill_env,
+            env=env,
             cwd=cwd,
         )
     except subprocess.TimeoutExpired:
-        return ToolResult(content="Command timed out.")
-    output = (result.stdout + result.stderr).strip()
+        return ToolResult(
+            content="Command timed out.",
+            data={
+                "cmd": cmd,
+                "cwd": cwd or "",
+                "exit_code": 124,
+                "timed_out": True,
+            },
+        )
+    stdout = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else (result.stdout or "")
+    stderr = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else (result.stderr or "")
+    output = (stdout + stderr).strip()
     output = textwrap.shorten(output, width=1500, placeholder="...")
-    return ToolResult(content=output or "(no output)")
+    return ToolResult(
+        content=output or "(no output)",
+        data={
+            "cmd": cmd,
+            "cwd": cwd or "",
+            "exit_code": int(result.returncode),
+            "timed_out": False,
+        },
+    )
 
 
 async def _file_write(args: Dict[str, Any]) -> ToolResult:

@@ -133,13 +133,48 @@ class LLMScheduler:
                 self._queue.task_done()
                 continue
 
-            try:
-                result = await self._client.generate(messages, tools=tools)
+            last_exc: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    result = await self._client.generate(messages, tools=tools)
+                    if not fut.done():
+                        fut.set_result(result)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if _is_transient(exc) and attempt < 2:
+                        delay = 2 ** attempt  # 1s, 2s
+                        logger.warning(
+                            "LLMScheduler transient error (attempt %d/3), retrying in %ds: %s",
+                            attempt + 1, delay, exc,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        break
+            if last_exc is not None:
+                logger.error("LLMScheduler call failed priority=%d: %s", priority, last_exc)
                 if not fut.done():
-                    fut.set_result(result)
-            except Exception as exc:
-                logger.error("LLMScheduler call failed priority=%d: %s", priority, exc)
-                if not fut.done():
-                    fut.set_exception(exc)
-            finally:
-                self._queue.task_done()
+                    fut.set_exception(last_exc)
+            self._queue.task_done()
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Return True for network/SSL errors that are safe to retry."""
+    msg = str(exc).lower()
+    transient_signals = (
+        "ssl",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "overloaded",
+        "rate limit",
+        "too many requests",
+        "bad record mac",
+        "eof occurred",
+        "remote end closed connection",
+    )
+    return any(s in msg for s in transient_signals)

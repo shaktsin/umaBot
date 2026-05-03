@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, TYPE_CHECKING
+from typing import Any, Dict, List, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from umabot.gateway import Gateway
@@ -43,6 +43,31 @@ class ControlPanelManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def send_observability_event(
+        self,
+        *,
+        event_name: str,
+        data: Dict[str, Any],
+        summary_text: str,
+        category: str,
+        detail_level: str,
+    ) -> None:
+        """Send a structured observability event with per-panel visibility filtering."""
+        tasks = [
+            self._send_observability_to_panel(
+                panel=panel,
+                event_name=event_name,
+                data=data,
+                summary_text=summary_text,
+                category=category,
+                detail_level=detail_level,
+            )
+            for panel in self.panels
+            if panel.enabled
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _send_to_panel(self, panel: "ControlPanelConfig", message: str) -> None:
         try:
             if panel.ui_type == "web":
@@ -58,6 +83,45 @@ class ControlPanelManager:
                     )
         except Exception as exc:
             logger.error("Failed to send to control panel (type=%s): %s", panel.ui_type, exc)
+
+    async def _send_observability_to_panel(
+        self,
+        *,
+        panel: "ControlPanelConfig",
+        event_name: str,
+        data: Dict[str, Any],
+        summary_text: str,
+        category: str,
+        detail_level: str,
+    ) -> None:
+        if not _panel_allows_observability(panel, category, detail_level):
+            return
+        try:
+            if panel.ui_type == "web":
+                await self.gateway.send_panel_event(
+                    event_name=event_name,
+                    data=data,
+                    chat_id="admin",
+                )
+                return
+            # Messaging panels receive summary text only.
+            if not summary_text:
+                return
+            channel = _channel_for_panel(panel, self.gateway.config)
+            if channel and panel.chat_id:
+                await self.gateway.send_message(
+                    channel=channel,
+                    chat_id=panel.chat_id,
+                    text=summary_text,
+                    connector=panel.connector or "",
+                )
+        except Exception as exc:
+            logger.error(
+                "Failed observability send to panel type=%s event=%s: %s",
+                panel.ui_type,
+                event_name,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Routing helpers
@@ -131,3 +195,16 @@ def _channel_for_panel(panel: "ControlPanelConfig", config) -> str:
         if "whatsapp" in conn_type:
             return "whatsapp"
     return panel.ui_type
+
+
+def _panel_allows_observability(panel: "ControlPanelConfig", category: str, detail_level: str) -> bool:
+    obs = getattr(panel, "observability", None)
+    if category == "multi_agent_logs":
+        configured = str(getattr(obs, "multi_agent_logs", "") or "").strip().lower() or "none"
+    else:
+        configured = str(getattr(obs, "multi_agent_topology", "") or "").strip().lower() or "summary"
+
+    order = {"none": 0, "summary": 1, "full": 2}
+    required = order.get(str(detail_level).strip().lower(), 1)
+    allowed = order.get(configured, 0)
+    return allowed >= required

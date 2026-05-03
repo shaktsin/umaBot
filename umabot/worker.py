@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import json
 import logging
 import mimetypes
 import re
+import secrets
+import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from umabot.agents import DynamicOrchestrator
+from umabot.agents import DynamicOrchestrator, TeamExecutor, TeamRegistry
 from umabot.intent import IntentResult, detect_intent, intent_context_block
 from umabot.llm import ClaudeClient, GeminiClient, OpenAIClient
 from umabot.llm.rate_limiter import TokenBucket
@@ -22,10 +26,11 @@ from umabot.storage import Database, Queue
 from umabot.tasks.parser import parse_control_task_request
 from umabot.tasks.schedule import compute_initial_next_run_at, compute_next_run_at
 from umabot.tools import ToolRegistry, UnifiedToolRegistry
-from umabot.tools.registry import Attachment
+from umabot.tools.registry import Attachment, RISK_RED
 from umabot.tools.builtin import set_active_skill_env
 from umabot.tools.workspace import (
     detect_workspace_from_text,
+    enforce_path,
     get_active_workspace,
     resolve_workspace,
     set_active_workspace,
@@ -49,6 +54,7 @@ class Worker:
         send_message,
         send_control_message,
         send_confirmation_request=None,
+        send_control_observability_event=None,
     ) -> None:
         self.config = config
         self.db = db
@@ -60,9 +66,11 @@ class Worker:
         self.send_message = send_message
         self.send_control_message = send_control_message
         self.send_confirmation_request = send_confirmation_request
+        self.send_control_observability_event = send_control_observability_event
         self._stop = asyncio.Event()
         self._tasks: List[asyncio.Task] = []
         self._chat_locks: Dict[str, asyncio.Lock] = {}
+        self._pending_orchestrator_approvals: Dict[str, asyncio.Future] = {}
         self._context_state = ContextState(revision=0, fingerprint="", system_messages=[])
 
         # Build a shared token bucket when agents are enabled and a budget is configured.
@@ -102,6 +110,12 @@ class Worker:
 
         # Load user-defined agent context from AGENT.md (empty string if file absent)
         self.agent_context = _load_agent_context(getattr(agents_cfg, "context_file", ""))
+        self.team_registry = TeamRegistry(
+            db=self.db,
+            tool_registry=self.tool_registry,
+            skill_registry=self.skill_registry,
+            config=self.config,
+        )
 
     @property
     def _concurrency(self) -> int:
@@ -181,6 +195,12 @@ class Worker:
         if job_type == "confirm":
             await self._process_confirmation(payload)
             return
+        if job_type == "agent_approve":
+            await self.resolve_orchestrator_approval(
+                str(payload.get("token", "")),
+                bool(payload.get("approved", False)),
+            )
+            return
         if job_type == "task_run":
             await self._process_task_run(payload)
             return
@@ -210,6 +230,7 @@ class Worker:
         lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
             self.skill_registry.refresh()
+            self.team_registry.refresh()
             self._context_state = _refresh_context_state(
                 self._context_state, self.skill_registry, self.tool_registry
             )
@@ -305,6 +326,9 @@ class Worker:
             if connector_role == "listener":
                 messages = [_date_system_message(), {"role": "user", "content": text}]
             else:
+                # Persist the incoming user message so it appears in chat history
+                # after a page reload (assistant messages are already stored on reply).
+                self.db.add_message(session_id, "user", text)
                 messages = self.db.list_recent_messages(session_id, limit=20)
                 messages = [_date_system_message()] + messages
 
@@ -398,6 +422,130 @@ class Worker:
 
             # Route through the dynamic orchestrator when it's enabled
             if using_orchestrator and not is_gmail_listener_flow:
+                team_cfg = getattr(self.config, "agent_teams", None)
+                team_feature_enabled = bool(getattr(team_cfg, "enabled", False))
+                if team_feature_enabled:
+                    fit = self.team_registry.fit_check(
+                        text,
+                        min_len=int(getattr(team_cfg, "fit_min_query_len", 60) or 60),
+                        enabled=bool(getattr(team_cfg, "fit_gate_enabled", True)),
+                    )
+                    await self._emit_team_event(
+                        "team.fit.started",
+                        {
+                            "passed": fit.get("passed"),
+                            "reason": fit.get("reason"),
+                            "complexity_class": fit.get("complexity_class"),
+                            "task_len": len(text or ""),
+                        },
+                    )
+
+                    if fit.get("passed"):
+                        selection = self.team_registry.select_team(
+                            task=text,
+                            allowed_tools=allowed_tools,
+                            default_threshold=float(
+                                getattr(team_cfg, "default_confidence_threshold", 0.62) or 0.62
+                            ),
+                            max_teams_considered=int(
+                                getattr(team_cfg, "max_teams_considered", 20) or 20
+                            ),
+                            routing_mode=str(getattr(team_cfg, "routing_mode", "hybrid") or "hybrid"),
+                        )
+                        if selection.team:
+                            await self._emit_team_event(
+                                "team.route.selected",
+                                {
+                                    "team_id": selection.team.get("id"),
+                                    "team_name": selection.team.get("name"),
+                                    "score": selection.score,
+                                    "threshold": selection.threshold,
+                                    "selected_by": selection.selected_by,
+                                    "rationale": selection.rationale,
+                                },
+                            )
+                            try:
+                                final_reply, final_attachments = await self._run_with_team(
+                                    team=selection.team,
+                                    task=text,
+                                    history=messages,
+                                    channel=channel,
+                                    chat_id=chat_id,
+                                    connector=connector,
+                                    session_id=session_id,
+                                    allowed_tools=allowed_tools,
+                                    agents_cfg=agents_cfg,
+                                    complexity_class=str(fit.get("complexity_class", "moderate")),
+                                    selected_by=selection.selected_by,
+                                    route_rationale=selection.rationale,
+                                    source_connector=source_connector,
+                                    kind=kind,
+                                    intent=intent,
+                                    explicit_admin_gmail_search=explicit_admin_gmail_search,
+                                    connector_role=connector_role,
+                                )
+                            except Exception as exc:
+                                logger.exception("Team execution failed team_id=%s error=%s", selection.team.get("id"), exc)
+                                await self._notify(
+                                    channel,
+                                    chat_id,
+                                    f"Team execution failed: {exc}",
+                                    connector,
+                                    connector_role=connector_role,
+                                )
+                                return
+                            if final_reply:
+                                if not final_attachments:
+                                    final_attachments = self._build_orchestrator_attachment_fallback(final_reply)
+                                message_id = self.db.add_message(session_id, "assistant", final_reply)
+                                if final_attachments:
+                                    self.db.add_message_attachments(message_id, final_attachments)
+                                await self._notify(
+                                    channel,
+                                    chat_id,
+                                    final_reply,
+                                    connector,
+                                    connector_role=connector_role,
+                                    attachments=final_attachments,
+                                )
+                            return
+
+                        await self._emit_team_event(
+                            "team.route.not_selected",
+                            {
+                                "score": selection.score,
+                                "threshold": selection.threshold,
+                                "selected_by": selection.selected_by,
+                                "rationale": selection.rationale,
+                            },
+                        )
+                        if not bool(getattr(team_cfg, "fallback_to_dynamic", True)):
+                            await self._notify(
+                                channel,
+                                chat_id,
+                                "No agent team matched this request and dynamic fallback is disabled.",
+                                connector,
+                                connector_role=connector_role,
+                            )
+                            return
+                    else:
+                        await self._emit_team_event(
+                            "team.fit.rejected",
+                            {
+                                "reason": fit.get("reason"),
+                                "complexity_class": fit.get("complexity_class"),
+                            },
+                        )
+                        if not bool(getattr(team_cfg, "fallback_to_dynamic", True)):
+                            await self._notify(
+                                channel,
+                                chat_id,
+                                f"Multi-agent fit rejected: {fit.get('reason', 'unknown reason')}",
+                                connector,
+                                connector_role=connector_role,
+                            )
+                            return
+
                 logger.info(
                     "Routing to DynamicOrchestrator kind=%s session_id=%s",
                     kind, session_id,
@@ -427,6 +575,10 @@ class Worker:
                         agents_cfg=agents_cfg,
                         skill_context=skill_context,
                         skill_context_full=skill_context_full,
+                        source_connector=source_connector,
+                        kind=kind,
+                        intent=intent,
+                        explicit_admin_gmail_search=explicit_admin_gmail_search,
                         connector_role=connector_role,
                     )
                 except Exception as exc:
@@ -564,34 +716,58 @@ class Worker:
                         )
                         return
                     if tool_decision.effect == "require_confirmation":
-                        decision = self.policy.request_confirmation(
-                            tool_call={
-                                "name": tool_call.name,
-                                "arguments": tool_call.arguments,
-                                "id": tool_call.id,
-                            },
-                            chat_id=chat_id,
-                            channel=channel,
-                            connector=connector,
-                            session_id=session_id,
-                            message_id=assistant_message_id,
-                            messages=messages,
-                            reason=tool_decision.reason or "confirmation required by declarative policy",
-                        )
-                        logger.info(
-                            "Declarative policy requires confirmation tool=%s rule=%s",
-                            tool_call.name,
-                            tool_decision.rule_id,
-                        )
-                        await self._request_tool_confirmation(
-                            channel=channel,
-                            chat_id=chat_id,
-                            connector=connector,
-                            tool_call_name=tool_call.name,
-                            tool_call_arguments=tool_call.arguments,
-                            token=decision.token or "",
-                        )
-                        return
+                        if self._should_auto_approve_tool_confirmation(
+                            tool_name=tool_call.name,
+                            tool_arguments=tool_call.arguments,
+                            allowed_tools=allowed_tools,
+                        ):
+                            logger.info(
+                                "Auto-approved declarative confirmation tool=%s rule=%s workspace=%s",
+                                tool_call.name,
+                                tool_decision.rule_id,
+                                self._active_workspace_name(),
+                            )
+                            self.db.add_audit(
+                                "tool_auto_approved",
+                                {
+                                    "tool": tool_call.name,
+                                    "source": "declarative_policy",
+                                    "workspace": self._active_workspace_name(),
+                                    "reason": tool_decision.reason or "",
+                                },
+                                chat_id=chat_id,
+                                connector=connector,
+                                decision="auto_approved",
+                            )
+                        else:
+                            decision = self.policy.request_confirmation(
+                                tool_call={
+                                    "name": tool_call.name,
+                                    "arguments": tool_call.arguments,
+                                    "id": tool_call.id,
+                                },
+                                chat_id=chat_id,
+                                channel=channel,
+                                connector=connector,
+                                session_id=session_id,
+                                message_id=assistant_message_id,
+                                messages=messages,
+                                reason=tool_decision.reason or "confirmation required by declarative policy",
+                            )
+                            logger.info(
+                                "Declarative policy requires confirmation tool=%s rule=%s",
+                                tool_call.name,
+                                tool_decision.rule_id,
+                            )
+                            await self._request_tool_confirmation(
+                                channel=channel,
+                                chat_id=chat_id,
+                                connector=connector,
+                                tool_call_name=tool_call.name,
+                                tool_call_arguments=tool_call.arguments,
+                                token=decision.token or "",
+                            )
+                            return
 
                 # Security layer: evaluate before risk-level policy
                 if self.security_policy:
@@ -641,16 +817,38 @@ class Worker:
                     messages=messages,
                 )
                 if decision.require_confirmation:
-                    logger.info("Tool confirmation required name=%s", tool_call.name)
-                    await self._request_tool_confirmation(
-                        channel=channel,
-                        chat_id=chat_id,
-                        connector=connector,
-                        tool_call_name=tool_call.name,
-                        tool_call_arguments=tool_call.arguments,
-                        token=decision.token or "",
-                    )
-                    return
+                    if self._should_auto_approve_tool_confirmation(
+                        tool_name=tool_call.name,
+                        tool_arguments=tool_call.arguments,
+                        allowed_tools=allowed_tools,
+                    ):
+                        logger.info(
+                            "Auto-approved policy confirmation tool=%s workspace=%s",
+                            tool_call.name,
+                            self._active_workspace_name(),
+                        )
+                        self.db.add_audit(
+                            "tool_auto_approved",
+                            {
+                                "tool": tool_call.name,
+                                "source": "risk_policy",
+                                "workspace": self._active_workspace_name(),
+                            },
+                            chat_id=chat_id,
+                            connector=connector,
+                            decision="auto_approved",
+                        )
+                    else:
+                        logger.info("Tool confirmation required name=%s", tool_call.name)
+                        await self._request_tool_confirmation(
+                            channel=channel,
+                            chat_id=chat_id,
+                            connector=connector,
+                            tool_call_name=tool_call.name,
+                            tool_call_arguments=tool_call.arguments,
+                            token=decision.token or "",
+                        )
+                        return
                 if not decision.allowed:
                     logger.info("Tool denied name=%s reason=%s", tool_call.name, decision.reason)
                     await self._notify(channel, chat_id, f"Tool denied: {decision.reason}", connector, connector_role=connector_role)
@@ -725,15 +923,85 @@ class Worker:
         agents_cfg,
         skill_context: str = "",
         skill_context_full: str = "",
+        source_connector: str = "",
+        kind: str = "external",
+        intent: Optional[IntentResult] = None,
+        explicit_admin_gmail_search: bool = False,
         connector_role: str = "admin",
     ) -> tuple[str, Optional[list]]:
         """Delegate to DynamicOrchestrator and return final reply + attachments."""
         configured_workspaces = getattr(
             getattr(self.config, "tools", None), "workspaces", []
         ) or []
+        run_id = uuid.uuid4().hex[:12]
+        self.db.create_agent_team_run(
+            run_id=run_id,
+            team_id=None,
+            status="running",
+            complexity_class="moderate",
+            selected_by="rule",
+            budget_snapshot={},
+            route_rationale={"mode": "dynamic_orchestrator"},
+        )
 
         async def send_update(message: str) -> None:
             await self._notify(channel, chat_id, f"[update] {message}", connector, connector_role=connector_role)
+
+        async def send_observability_event(event_name: str, data: Dict[str, Any]) -> None:
+            if not self.send_control_observability_event:
+                return
+            payload = dict(data or {})
+            payload.setdefault("run_id", run_id)
+            payload.setdefault("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            logger.debug("obs_event db_write event=%s run_id=%s", event_name, run_id)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self.db.add_agent_team_event(run_id=run_id, event_name=event_name, payload=payload),
+            )
+            logger.debug("obs_event panel_send event=%s run_id=%s", event_name, run_id)
+            summary = _multi_agent_summary(event_name, payload)
+            try:
+                await self.send_control_observability_event(event_name, payload, summary)
+            except Exception as exc:
+                logger.debug("Failed to emit observability event %s: %s", event_name, exc)
+            logger.debug("obs_event done event=%s run_id=%s", event_name, run_id)
+
+        async def request_approval(reason: str, action_summary: str) -> bool:
+            token = secrets.token_hex(8)
+            loop = asyncio.get_event_loop()
+            future: asyncio.Future = loop.create_future()
+            self._pending_orchestrator_approvals[token] = future
+            try:
+                await send_observability_event(
+                    "multi_agent_approval_requested",
+                    {
+                        "run_id": run_id,
+                        "token": token,
+                        "reason": reason,
+                        "action_summary": action_summary,
+                    },
+                )
+                return await asyncio.wait_for(asyncio.shield(future), timeout=300.0)
+            except asyncio.TimeoutError:
+                logger.warning("Orchestrator approval timed out token=%s", token)
+                return False
+            finally:
+                self._pending_orchestrator_approvals.pop(token, None)
+
+        agent_tool_guard = self._build_agent_tool_guard(
+            allowed_tools=allowed_tools,
+            chat_id=chat_id,
+            channel=channel,
+            connector=connector,
+            source_connector=source_connector,
+            connector_role=connector_role,
+            kind=kind,
+            action=(intent.suggested_action if intent else ""),
+            importance=(intent.importance if intent else ""),
+            needs_admin=(intent.needs_admin if intent else None),
+            admin_explicit=explicit_admin_gmail_search,
+        )
 
         orchestrator = DynamicOrchestrator(
             orchestrator_llm=self.orchestrator_llm,
@@ -741,7 +1009,7 @@ class Worker:
             tool_registry=self.tool_registry,
             available_tool_names=allowed_tools,
             send_update_callback=send_update,
-            request_approval_callback=None,
+            request_approval_callback=request_approval,
             max_orchestrator_iterations=agents_cfg.max_orchestrator_iterations,
             max_agent_iterations=agents_cfg.max_agent_iterations,
             skill_context=skill_context,
@@ -749,10 +1017,105 @@ class Worker:
             agent_context=self.agent_context,
             skill_registry=self.skill_registry,
             workspaces=configured_workspaces,
+            run_id=run_id,
+            on_event=send_observability_event,
+            on_agent_tool_call=agent_tool_guard,
         )
 
         final_reply = await orchestrator.run(task=task, history=history)
+        self.db.complete_agent_team_run(run_id=run_id, status="completed")
         serialized = [a.to_dict() for a in orchestrator.collected_attachments]
+        return final_reply, (serialized or None)
+
+    async def _run_with_team(
+        self,
+        *,
+        team: Dict[str, Any],
+        task: str,
+        history: List[Dict[str, Any]],
+        channel: str,
+        chat_id: str,
+        connector: str,
+        session_id: int,
+        allowed_tools: List[str],
+        agents_cfg,
+        complexity_class: str,
+        selected_by: str,
+        route_rationale: Dict[str, Any],
+        source_connector: str = "",
+        kind: str = "external",
+        intent: Optional[IntentResult] = None,
+        explicit_admin_gmail_search: bool = False,
+        connector_role: str = "admin",
+    ) -> tuple[str, Optional[list]]:
+        configured_workspaces = getattr(
+            getattr(self.config, "tools", None), "workspaces", []
+        ) or []
+        run_id = uuid.uuid4().hex[:12]
+
+        async def send_update(message: str) -> None:
+            await self._notify(
+                channel,
+                chat_id,
+                f"[update] {message}",
+                connector,
+                connector_role=connector_role,
+            )
+
+        async def send_observability_event(event_name: str, data: Dict[str, Any]) -> None:
+            payload = dict(data or {})
+            payload.setdefault("run_id", run_id)
+            payload.setdefault("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            logger.debug("obs_event panel_send event=%s run_id=%s", event_name, run_id)
+            summary = _multi_agent_summary(event_name, payload)
+            if self.send_control_observability_event:
+                try:
+                    await self.send_control_observability_event(event_name, payload, summary)
+                except Exception as exc:
+                    logger.debug("Failed to emit observability event %s: %s", event_name, exc)
+            logger.debug("obs_event done event=%s run_id=%s", event_name, run_id)
+
+        agent_tool_guard = self._build_agent_tool_guard(
+            allowed_tools=allowed_tools,
+            chat_id=chat_id,
+            channel=channel,
+            connector=connector,
+            source_connector=source_connector,
+            connector_role=connector_role,
+            kind=kind,
+            action=(intent.suggested_action if intent else ""),
+            importance=(intent.importance if intent else ""),
+            needs_admin=(intent.needs_admin if intent else None),
+            admin_explicit=explicit_admin_gmail_search,
+        )
+
+        executor = TeamExecutor(
+            orchestrator_llm=self.orchestrator_llm,
+            agent_llm=self.agent_llm,
+            tool_registry=self.tool_registry,
+            db=self.db,
+            skill_registry=self.skill_registry,
+            workspaces=configured_workspaces,
+            agent_context=self.agent_context,
+            on_event=send_observability_event,
+            send_update=send_update,
+            max_orchestrator_iterations=agents_cfg.max_orchestrator_iterations,
+            max_agent_iterations=agents_cfg.max_agent_iterations,
+            on_agent_tool_call=agent_tool_guard,
+            request_approval=None,
+            disable_approval=True,
+        )
+
+        final_reply, attachments = await executor.execute(
+            team=team,
+            task=task,
+            history=history,
+            run_id=run_id,
+            complexity_class=complexity_class,
+            selected_by=selected_by,
+            route_rationale=route_rationale,
+        )
+        serialized = [a.to_dict() for a in attachments]
         return final_reply, (serialized or None)
 
     def _build_orchestrator_attachment_fallback(self, final_reply: str) -> Optional[list]:
@@ -786,6 +1149,18 @@ class Worker:
             len(attachments),
         )
         return [a.to_dict() for a in attachments]
+
+    async def _emit_team_event(self, event_name: str, payload: Dict[str, Any]) -> None:
+        if not self.send_control_observability_event:
+            return
+        try:
+            await self.send_control_observability_event(
+                event_name,
+                payload,
+                _multi_agent_summary(event_name, payload),
+            )
+        except Exception as exc:
+            logger.debug("Failed to emit team event %s: %s", event_name, exc)
 
     async def _process_task_run(self, payload: Dict[str, Any]) -> None:
         task_id = int(payload.get("task_id", 0))
@@ -882,13 +1257,18 @@ class Worker:
                             await self.send_control_message("system", chat_id, text)
                             return
                         if tool_decision.effect == "require_confirmation":
-                            text = (
-                                f"Task #{task_id} requires confirmation for tool '{tool_call.name}' "
-                                "(declarative policy). Skipping run."
-                            )
-                            self.db.fail_task_run(run_id=run_id, task_id=task_id, error=text)
-                            await self.send_control_message("system", chat_id, text)
-                            return
+                            if not self._should_auto_approve_tool_confirmation(
+                                tool_name=tool_call.name,
+                                tool_arguments=tool_call.arguments,
+                                allowed_tools=allowed_tools,
+                            ):
+                                text = (
+                                    f"Task #{task_id} requires confirmation for tool '{tool_call.name}' "
+                                    "(declarative policy). Skipping run."
+                                )
+                                self.db.fail_task_run(run_id=run_id, task_id=task_id, error=text)
+                                await self.send_control_message("system", chat_id, text)
+                                return
 
                     decision = self.policy.evaluate(
                         {"name": tool_call.name, "arguments": tool_call.arguments},
@@ -900,10 +1280,15 @@ class Worker:
                         messages=messages,
                     )
                     if decision.require_confirmation:
-                        text = f"Task #{task_id} requires confirmation for tool '{tool_call.name}'. Skipping run."
-                        self.db.fail_task_run(run_id=run_id, task_id=task_id, error=text)
-                        await self.send_control_message("system", chat_id, text)
-                        return
+                        if not self._should_auto_approve_tool_confirmation(
+                            tool_name=tool_call.name,
+                            tool_arguments=tool_call.arguments,
+                            allowed_tools=allowed_tools,
+                        ):
+                            text = f"Task #{task_id} requires confirmation for tool '{tool_call.name}'. Skipping run."
+                            self.db.fail_task_run(run_id=run_id, task_id=task_id, error=text)
+                            await self.send_control_message("system", chat_id, text)
+                            return
                     if not decision.allowed:
                         text = f"Task #{task_id} denied tool '{tool_call.name}': {decision.reason}"
                         self.db.fail_task_run(run_id=run_id, task_id=task_id, error=text)
@@ -998,6 +1383,11 @@ class Worker:
         if follow_up.content:
             self.db.add_message(session_id, "assistant", follow_up.content)
             await self.send_message(channel, chat_id, follow_up.content, connector=connector)
+
+    async def resolve_orchestrator_approval(self, token: str, approved: bool) -> None:
+        future = self._pending_orchestrator_approvals.get(token)
+        if future and not future.done():
+            future.set_result(approved)
 
     async def _handle_control_task_commands(
         self,
@@ -1121,6 +1511,219 @@ class Worker:
             return []
         return list(self.tool_registry.list().keys())
 
+    def _active_workspace_name(self) -> str:
+        ws = get_active_workspace()
+        if not ws:
+            return ""
+        return str(getattr(ws, "name", "") or "")
+
+    def _build_agent_tool_guard(
+        self,
+        *,
+        allowed_tools: List[str],
+        chat_id: str,
+        channel: str,
+        connector: str,
+        source_connector: str,
+        connector_role: str,
+        kind: str,
+        action: str,
+        importance: str,
+        needs_admin: Optional[bool],
+        admin_explicit: bool,
+    ):
+        """Build per-tool preflight guard for spawned/team agents.
+
+        In auto_approve_workspace mode we fail closed for confirmation-required
+        tool calls that are outside auto-approval policy, so agent teams do not
+        stall on hidden approval requirements.
+        """
+        allowed_set = set(allowed_tools or [])
+
+        async def _guard(tool_name: str, tool_arguments: Dict[str, Any]) -> None:
+            policy_cfg = getattr(self.config, "policy", None)
+            mode = str(getattr(policy_cfg, "approval_mode", "normal") or "normal").strip().lower()
+            if mode != "auto_approve_workspace":
+                return
+
+            if tool_name not in allowed_set:
+                raise RuntimeError(f"Tool not allowed in this run: {tool_name}")
+
+            tool = self.tool_registry.get(tool_name)
+            if not tool:
+                raise RuntimeError(f"Unknown tool: {tool_name}")
+
+            args = tool_arguments if isinstance(tool_arguments, dict) else {}
+            try:
+                self.tool_registry.validate_args(tool_name, args)
+            except Exception as exc:
+                raise RuntimeError(f"Invalid args for {tool_name}: {exc}") from exc
+
+            if self.declarative_policy.has_rules:
+                decision = self.declarative_policy.decide_tool(
+                    tool_name,
+                    RuleContext(
+                        connector=connector,
+                        source_connector=source_connector,
+                        connector_role=connector_role,
+                        channel=channel,
+                        direction="outbound",
+                        kind=kind,
+                        action=action,
+                        importance=importance,
+                        needs_admin=needs_admin,
+                        admin_explicit=admin_explicit,
+                    ),
+                )
+                if decision.effect == "deny":
+                    raise RuntimeError(
+                        f"Tool denied by declarative policy: {decision.reason or tool_name}"
+                    )
+                if decision.effect == "require_confirmation":
+                    if self._should_auto_approve_tool_confirmation(
+                        tool_name=tool_name,
+                        tool_arguments=args,
+                        allowed_tools=allowed_tools,
+                    ):
+                        self.db.add_audit(
+                            "tool_auto_approved",
+                            {
+                                "tool": tool_name,
+                                "source": "agent_declarative_policy",
+                                "workspace": self._active_workspace_name(),
+                                "reason": decision.reason or "",
+                            },
+                            chat_id=chat_id,
+                            connector=connector,
+                            decision="auto_approved",
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Approval required by declarative policy and auto_approve_workspace "
+                            "did not match this tool call."
+                        )
+
+            if self.security_policy:
+                sec = self.security_policy.evaluate(tool_name, user_id=chat_id, connector=connector)
+                if not sec.allowed:
+                    raise RuntimeError(f"Access denied: {sec.reason}")
+
+                if getattr(getattr(self.config, "security", None), "ssrf_protection", True):
+                    url_arg = str(args.get("url", "") or "").strip()
+                    if url_arg:
+                        check_ssrf(url_arg)
+
+            if tool.risk_level == RISK_RED:
+                if self._should_auto_approve_tool_confirmation(
+                    tool_name=tool_name,
+                    tool_arguments=args,
+                    allowed_tools=allowed_tools,
+                ):
+                    self.db.add_audit(
+                        "tool_auto_approved",
+                        {
+                            "tool": tool_name,
+                            "source": "agent_risk_policy",
+                            "workspace": self._active_workspace_name(),
+                        },
+                        chat_id=chat_id,
+                        connector=connector,
+                        decision="auto_approved",
+                    )
+                    return
+                raise RuntimeError(
+                    "Approval required for high-risk tool and auto_approve_workspace "
+                    "did not match this tool call."
+                )
+
+        return _guard
+
+    def _should_auto_approve_tool_confirmation(
+        self,
+        *,
+        tool_name: str,
+        tool_arguments: Dict[str, Any] | None,
+        allowed_tools: List[str],
+    ) -> bool:
+        policy_cfg = getattr(self.config, "policy", None)
+        mode = str(getattr(policy_cfg, "approval_mode", "normal") or "normal").strip().lower()
+        if mode != "auto_approve_workspace":
+            return False
+
+        ws = get_active_workspace()
+        if not ws:
+            return False
+
+        workspace_name = str(getattr(ws, "name", "") or "").strip().lower()
+        allowed_workspaces = [
+            str(item).strip().lower()
+            for item in list(getattr(policy_cfg, "auto_approve_workspaces", []) or [])
+            if str(item).strip()
+        ]
+        if allowed_workspaces and workspace_name not in allowed_workspaces:
+            return False
+
+        if tool_name not in allowed_tools:
+            return False
+
+        tool_patterns = [
+            str(item).strip().lower()
+            for item in list(getattr(policy_cfg, "auto_approve_tools", []) or [])
+            if str(item).strip()
+        ]
+        if not tool_patterns:
+            return False
+        lowered_tool = str(tool_name or "").strip().lower()
+        if not any(fnmatch.fnmatch(lowered_tool, pattern) for pattern in tool_patterns):
+            return False
+
+        args = tool_arguments if isinstance(tool_arguments, dict) else {}
+        if tool_name == "shell.run":
+            cmd = str(args.get("cmd", "") or "").strip()
+            return self._is_auto_approve_shell_command_allowed(cmd)
+
+        file_op_map = {
+            "file.read": "read",
+            "file.list": "list",
+            "file.write": "write",
+            "file.delete": "delete",
+        }
+        if tool_name in file_op_map:
+            path_value = str(args.get("path", "") or "").strip()
+            if not path_value:
+                return False
+            try:
+                enforce_path(path_value, ws, operation=file_op_map[tool_name])
+            except Exception:
+                return False
+
+        return True
+
+    def _is_auto_approve_shell_command_allowed(self, cmd: str) -> bool:
+        cmd = (cmd or "").strip()
+        if not cmd:
+            return False
+
+        # Refuse command chains/subshells/redirection in auto-approve mode.
+        forbidden_tokens = ("&&", "||", "|", ";", "$(", "`", ">", "<", "\n", "\r")
+        if any(token in cmd for token in forbidden_tokens):
+            return False
+
+        policy_cfg = getattr(self.config, "policy", None)
+        prefixes = [
+            " ".join(str(item).strip().split())
+            for item in list(getattr(policy_cfg, "auto_approve_shell_commands", []) or [])
+            if str(item).strip()
+        ]
+        if not prefixes:
+            return False
+
+        normalized = " ".join(cmd.split())
+        for prefix in prefixes:
+            if normalized == prefix or normalized.startswith(prefix + " "):
+                return True
+        return False
+
 
 def _build_agent_llm_client(config, agent_model_cfg, rate_limiter=None):
     """Build an LLM client for a specific agent role config.
@@ -1130,11 +1733,10 @@ def _build_agent_llm_client(config, agent_model_cfg, rate_limiter=None):
     """
     provider = agent_model_cfg.provider or config.llm.provider
     model = agent_model_cfg.model or config.llm.model
-    api_key = agent_model_cfg.api_key or config.llm.api_key
+    api_key = agent_model_cfg.api_key or _resolve_provider_api_key(config, provider)
     reasoning_effort = agent_model_cfg.reasoning_effort
 
-    if not api_key:
-        raise RuntimeError("Agent LLM API key not configured")
+    _validate_provider_config(config, provider, model, api_key, for_agent=True)
 
     provider = provider.lower()
     if provider == "openai":
@@ -1292,16 +1894,58 @@ def _load_agent_context(context_file: str) -> str:
 
 def _build_llm_client(config, rate_limiter=None):
     provider = config.llm.provider.lower()
+    model = config.llm.model
     api_key = config.llm.api_key
     if not api_key:
-        raise RuntimeError("LLM API key not configured")
+        api_key = _resolve_provider_api_key(config, provider)
+    _validate_provider_config(config, provider, model, api_key, for_agent=False)
     if provider == "openai":
-        return OpenAIClient(api_key, config.llm.model, reasoning_effort=config.llm.reasoning_effort, rate_limiter=rate_limiter)
+        return OpenAIClient(api_key, model, reasoning_effort=config.llm.reasoning_effort, rate_limiter=rate_limiter)
     if provider == "claude":
-        return ClaudeClient(api_key, config.llm.model, rate_limiter=rate_limiter)
+        return ClaudeClient(api_key, model, rate_limiter=rate_limiter)
     if provider == "gemini":
-        return GeminiClient(api_key, config.llm.model, rate_limiter=rate_limiter)
+        return GeminiClient(api_key, model, rate_limiter=rate_limiter)
     raise RuntimeError(f"Unknown LLM provider: {provider}")
+
+
+def _resolve_provider_api_key(config, provider: str) -> Optional[str]:
+    provider = (provider or "").lower()
+    providers = getattr(config, "llm_providers", {}) or {}
+    provider_cfg = providers.get(provider) if isinstance(providers, dict) else None
+    if provider_cfg is not None:
+        api_key = getattr(provider_cfg, "api_key", None)
+        if api_key:
+            return api_key
+    return getattr(getattr(config, "llm", None), "api_key", None)
+
+
+def _validate_provider_config(
+    config,
+    provider: str,
+    model: str,
+    api_key: Optional[str],
+    *,
+    for_agent: bool,
+) -> None:
+    providers = getattr(config, "llm_providers", {}) or {}
+    provider = (provider or "").lower()
+    provider_cfg = providers.get(provider) if isinstance(providers, dict) else None
+
+    if provider_cfg is not None:
+        if not getattr(provider_cfg, "enabled", True):
+            subject = "Agent LLM provider" if for_agent else "LLM provider"
+            raise RuntimeError(f"{subject} '{provider}' is disabled in llm_providers")
+        configured_models = [m for m in (getattr(provider_cfg, "models", []) or []) if m]
+        if configured_models and model not in configured_models:
+            raise RuntimeError(
+                f"Model '{model}' is not enabled for provider '{provider}'. "
+                f"Allowed models: {', '.join(configured_models)}"
+            )
+
+    if not api_key:
+        if for_agent:
+            raise RuntimeError(f"Agent LLM API key not configured for provider '{provider}'")
+        raise RuntimeError(f"LLM API key not configured for provider '{provider}'")
 
 
 def _build_tool_specs(
@@ -1335,6 +1979,50 @@ def _tool_call_payload(call) -> Dict[str, Any]:
         "type": "function",
         "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
     }
+
+
+def _multi_agent_summary(event_name: str, payload: Dict[str, Any]) -> str:
+    run_id = str(payload.get("run_id", ""))
+    if event_name == "team.fit.started":
+        passed = bool(payload.get("passed"))
+        reason = str(payload.get("reason", ""))
+        return f"[team-fit] {'accepted' if passed else 'rejected'}: {reason}"
+    if event_name == "team.fit.rejected":
+        reason = str(payload.get("reason", ""))
+        return f"[team-fit] rejected: {reason}"
+    if event_name == "team.route.selected":
+        name = str(payload.get("team_name", "")) or f"team:{payload.get('team_id', '')}"
+        score = payload.get("score")
+        threshold = payload.get("threshold")
+        return f"[team-route] selected `{name}` score={score} threshold={threshold}"
+    if event_name == "team.route.not_selected":
+        score = payload.get("score")
+        threshold = payload.get("threshold")
+        return f"[team-route] no team selected score={score} threshold={threshold}"
+    if event_name == "multi_agent_run_started":
+        task = str(payload.get("task", "") or "")
+        if len(task) > 120:
+            task = task[:117] + "..."
+        return f"[multi-agent] Run `{run_id}` started. Task: {task}"
+    if event_name == "multi_agent_node_added":
+        role = str(payload.get("role", "agent"))
+        node_id = str(payload.get("node_id", ""))
+        return f"[multi-agent] Spawned `{role}` ({node_id})."
+    if event_name == "multi_agent_node_status":
+        role = str(payload.get("role", "agent"))
+        status = str(payload.get("status", "unknown"))
+        node_id = str(payload.get("node_id", ""))
+        return f"[multi-agent] `{role}` ({node_id}) → {status}."
+    if event_name == "multi_agent_run_completed":
+        status = str(payload.get("status", "completed"))
+        return f"[multi-agent] Run `{run_id}` {status}."
+    if event_name == "multi_agent_node_log":
+        role = str(payload.get("role", "agent"))
+        msg = str(payload.get("message", "") or "").strip()
+        if len(msg) > 120:
+            msg = msg[:117] + "..."
+        return f"[multi-agent] {role}: {msg}"
+    return ""
 
 
 @dataclass

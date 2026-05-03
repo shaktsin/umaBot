@@ -1,7 +1,7 @@
 <script lang="ts">
   import { appStore, type PanelId } from '$lib/stores/app.svelte';
   import {
-    LayoutDashboard, MessageSquare, Plug, Wand2, Clock, Shield, Settings, FileText,
+    LayoutDashboard, MessageSquare, Plug, Wand2, Clock, Shield, Settings, FileText, BrainCircuit, ServerCog, Users,
   } from 'lucide-svelte';
 
   const navGroups = [
@@ -18,11 +18,14 @@
         { id: 'connectors' as PanelId, label: 'Connectors', icon: Plug },
         { id: 'skills'     as PanelId, label: 'Skills',     icon: Wand2 },
         { id: 'tasks'      as PanelId, label: 'Tasks',      icon: Clock },
+        { id: 'agent_teams' as PanelId, label: 'Agent Teams', icon: Users },
       ],
     },
     {
       label: 'System',
       items: [
+        { id: 'providers' as PanelId, label: 'LLM Providers', icon: BrainCircuit },
+        { id: 'mcp' as PanelId, label: 'MCP Servers', icon: ServerCog },
         { id: 'policy' as PanelId, label: 'Policy', icon: Shield },
         { id: 'config' as PanelId, label: 'Config', icon: Settings },
         { id: 'logs'   as PanelId, label: 'Logs',   icon: FileText },

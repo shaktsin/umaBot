@@ -8,13 +8,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from umabot.controlpanel.connector import GatewayConnector
 from umabot.controlpanel.events import EventBroadcaster
-from umabot.controlpanel.routers import chat, config_router, connectors, dashboard, logs, policy, skills, tasks
+from umabot.controlpanel.routers import admin, agent_teams, chat, config_router, connectors, dashboard, logs, policy, skills, tasks
 from umabot.controlpanel.store import PanelStore
 
 logger = logging.getLogger("umabot.controlpanel")
@@ -39,6 +40,7 @@ def create_app(
     config_path: str,
     db,
     skill_registry,
+    tool_registry=None,
 ) -> FastAPI:
     """Create and configure the FastAPI control panel application."""
     store = PanelStore()
@@ -70,6 +72,7 @@ def create_app(
     app.state.connector = connector
     app.state.broadcaster = broadcaster
     app.state.skill_registry = skill_registry
+    app.state.tool_registry = tool_registry
 
     # Mount routers
     app.include_router(dashboard.router, prefix="/api")
@@ -78,6 +81,8 @@ def create_app(
     app.include_router(tasks.router, prefix="/api")
     app.include_router(policy.router, prefix="/api")
     app.include_router(config_router.router, prefix="/api")
+    app.include_router(admin.router, prefix="/api")
+    app.include_router(agent_teams.router, prefix="/api")
     app.include_router(logs.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
 
@@ -172,6 +177,7 @@ def run_panel(
         config_path=resolved_path,
         db=db,
         skill_registry=skill_registry,
+        tool_registry=tool_registry,
     )
 
     if open_browser:

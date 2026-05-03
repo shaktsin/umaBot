@@ -100,6 +100,7 @@ class DynamicOrchestrator:
             — asks the user for confirmation; returns True if approved.
         max_orchestrator_iterations: Max LLM cycles for the orchestrator itself.
         max_agent_iterations: Max LLM cycles per spawned agent.
+        on_event: Optional callback for structured multi-agent telemetry.
     """
 
     def __init__(
@@ -111,13 +112,18 @@ class DynamicOrchestrator:
         available_tool_names: List[str],
         send_update_callback: Callable[[str], Coroutine],
         request_approval_callback: Optional[Callable[[str, str], Coroutine]] = None,
+        disable_approval: bool = False,
         max_orchestrator_iterations: int = 20,
         max_agent_iterations: int = 15,
+        role_max_iterations: Optional[Dict[str, int]] = None,
         skill_context: str = "",
         skill_context_full: str = "",
         agent_context: str = "",
         skill_registry=None,
         workspaces: Optional[List] = None,
+        run_id: str = "",
+        on_event: Optional[Callable[[str, Dict[str, Any]], Coroutine]] = None,
+        on_agent_tool_call: Optional[Callable[[str, Dict[str, Any]], Coroutine]] = None,
     ) -> None:
         self.orchestrator_llm = orchestrator_llm
         self.agent_llm = agent_llm
@@ -125,8 +131,10 @@ class DynamicOrchestrator:
         self.available_tool_names = available_tool_names
         self.send_update_callback = send_update_callback
         self.request_approval_callback = request_approval_callback
+        self.disable_approval = disable_approval
         self.max_orchestrator_iterations = max_orchestrator_iterations
         self.max_agent_iterations = max_agent_iterations
+        self.role_max_iterations: Dict[str, int] = role_max_iterations or {}
         self.skill_context = skill_context
         self.skill_context_full = skill_context_full  # retained for API compat, no longer pre-injected
         # User-defined standing context from AGENT.md
@@ -134,6 +142,10 @@ class DynamicOrchestrator:
         self.skill_registry = skill_registry
         self.workspaces: List = workspaces or []
         self._collected_attachments: List[Attachment] = []
+        self.run_id = run_id
+        self.on_event = on_event
+        self.on_agent_tool_call = on_agent_tool_call
+        self._agent_seq = 0
 
     async def run(self, task: str, history: Optional[List[Dict[str, Any]]] = None) -> str:
         """Run the full orchestration for ``task`` and return the final reply.
@@ -144,11 +156,7 @@ class DynamicOrchestrator:
         """
         self._collected_attachments = []
         tool_catalog = self._build_tool_catalog()
-        skill_note = (
-            f"\n{self.skill_context}"
-            "\nHave the specialist agent call skill.get_instructions first to load the full instructions."
-            if self.skill_context else ""
-        )
+        skill_note = f"\n{self.skill_context}" if self.skill_context else ""
 
         now_utc = datetime.now(timezone.utc)
         # Monday=0 … Sunday=6; back-calculate to Monday
@@ -186,6 +194,27 @@ class DynamicOrchestrator:
                     messages.append({"role": msg["role"], "content": msg.get("content") or ""})
 
         messages.append({"role": "user", "content": task})
+        await self._emit(
+            "multi_agent_run_started",
+            {
+                "run_id": self.run_id,
+                "task": task,
+                "status": "running",
+                "started_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "root_node_id": "orchestrator",
+                "nodes": [
+                    {
+                        "node_id": "orchestrator",
+                        "parent_node_id": "",
+                        "role": "orchestrator",
+                        "status": "running",
+                        "model": getattr(self.orchestrator_llm, "model", ""),
+                        "workspace": "",
+                        "objective": "Plan, spawn agents, and synthesize output.",
+                    }
+                ],
+            },
+        )
 
         orchestrator_tools = self._orchestrator_tools_spec()
 
@@ -193,6 +222,22 @@ class DynamicOrchestrator:
 
         for iteration in range(self.max_orchestrator_iterations):
             response = await self.orchestrator_llm.generate(messages, tools=orchestrator_tools)
+            await self._emit(
+                "multi_agent_node_log",
+                {
+                    "run_id": self.run_id,
+                    "node_id": "orchestrator",
+                    "parent_node_id": "",
+                    "role": "orchestrator",
+                    "event_type": "orchestrator.iteration",
+                    "message": f"Iteration {iteration + 1} completed",
+                    "payload": {
+                        "iteration": iteration + 1,
+                        "tool_calls": len(response.tool_calls or []),
+                        "content_len": len(response.content or ""),
+                    },
+                },
+            )
             logger.debug(
                 "Orchestrator iter=%d content_len=%d tool_calls=%d",
                 iteration,
@@ -203,6 +248,15 @@ class DynamicOrchestrator:
 
             if not response.tool_calls:
                 # Orchestrator is done
+                await self._emit(
+                    "multi_agent_run_completed",
+                    {
+                        "run_id": self.run_id,
+                        "status": "completed",
+                        "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "summary": response.content or "",
+                    },
+                )
                 return response.content or ""
 
             # Process each orchestrator tool call
@@ -220,6 +274,15 @@ class DynamicOrchestrator:
         # Max iterations reached
         logger.warning("Orchestrator reached max_iterations=%d", self.max_orchestrator_iterations)
         final = await self.orchestrator_llm.generate(messages, tools=None)
+        await self._emit(
+            "multi_agent_run_completed",
+            {
+                "run_id": self.run_id,
+                "status": "completed",
+                "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "summary": final.content or "",
+            },
+        )
         return final.content or "Orchestrator reached iteration limit without completing the task."
 
     # ------------------------------------------------------------------
@@ -268,7 +331,23 @@ class DynamicOrchestrator:
             logger.warning("Orchestrator granted invalid tools %s for agent role=%s (ignored)", invalid, role)
 
         logger.info("Spawning agent role=%s tools=%s", role, valid_tool_names)
+        self._agent_seq += 1
+        node_id = f"agent-{self._agent_seq}"
+        await self._emit(
+            "multi_agent_node_added",
+            {
+                "run_id": self.run_id,
+                "node_id": node_id,
+                "parent_node_id": "orchestrator",
+                "role": role,
+                "status": "queued",
+                "objective": objective,
+                "workspace": ws.name if ws else "",
+                "model": getattr(self.agent_llm, "model", ""),
+            },
+        )
 
+        agent_max_iter = self.role_max_iterations.get(role) or self.max_agent_iterations
         agent = SpawnedAgent(
             role=role,
             objective=objective,
@@ -277,7 +356,12 @@ class DynamicOrchestrator:
             context=context,
             llm_client=self.agent_llm,
             tool_registry=self.tool_registry,
-            max_iterations=self.max_agent_iterations,
+            max_iterations=agent_max_iter,
+            on_tool_call=self.on_agent_tool_call,
+            on_event=self.on_event,
+            run_id=self.run_id,
+            agent_id=node_id,
+            parent_agent_id="orchestrator",
         )
 
         try:
@@ -290,14 +374,55 @@ class DynamicOrchestrator:
                 len(result.content or ""),
                 len(result.attachments),
             )
+            await self._emit(
+                "multi_agent_node_status",
+                {
+                    "run_id": self.run_id,
+                    "node_id": node_id,
+                    "parent_node_id": "orchestrator",
+                    "role": role,
+                    "status": "completed",
+                },
+            )
             return f"[{role} result]\n{result.content}"
         except Exception as exc:
             logger.exception("Agent role=%s failed", role)
+            await self._emit(
+                "multi_agent_node_status",
+                {
+                    "run_id": self.run_id,
+                    "node_id": node_id,
+                    "parent_node_id": "orchestrator",
+                    "role": role,
+                    "status": "failed",
+                    "error": str(exc),
+                },
+            )
+            await self._emit(
+                "multi_agent_node_log",
+                {
+                    "run_id": self.run_id,
+                    "node_id": node_id,
+                    "parent_node_id": "orchestrator",
+                    "role": role,
+                    "event_type": "agent.error",
+                    "message": str(exc),
+                    "payload": {},
+                },
+            )
             return f"[{role} failed]: {exc}"
 
     @property
     def collected_attachments(self) -> List[Attachment]:
         return list(self._collected_attachments)
+
+    async def _emit(self, event_name: str, data: Dict[str, Any]) -> None:
+        if not self.on_event:
+            return
+        try:
+            await self.on_event(event_name, data)
+        except Exception:
+            pass
 
     async def _send_update(self, args: Dict[str, Any]) -> str:
         message = str(args.get("message", ""))
@@ -344,7 +469,7 @@ class DynamicOrchestrator:
         return "\n".join(lines) if lines else "  (no tools available)"
 
     def _orchestrator_tools_spec(self) -> List[Dict[str, Any]]:
-        return [
+        tools = [
             {
                 "name": "spawn_agent",
                 "description": (
@@ -427,3 +552,6 @@ class DynamicOrchestrator:
                 },
             },
         ]
+        if self.disable_approval:
+            tools = [t for t in tools if t["name"] != "request_approval"]
+        return tools

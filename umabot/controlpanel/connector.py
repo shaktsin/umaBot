@@ -68,6 +68,11 @@ class GatewayConnector:
         else:
             logger.warning("Cannot send message: not connected to gateway")
 
+    async def send_agent_approval(self, token: str, approved: bool) -> None:
+        """Resolve a pending orchestrator approval request."""
+        prefix = "AGENT_APPROVE" if approved else "AGENT_DENY"
+        await self.send_message(f"{prefix}:{token}")
+
     async def _connect_loop(self) -> None:
         while True:
             try:
@@ -112,7 +117,15 @@ class GatewayConnector:
 
     async def _handle_incoming(self, data: dict) -> None:
         """Handle a message received from the gateway (assistant response)."""
-        if data.get("type") != "send":
+        msg_type = data.get("type")
+        if msg_type == "panel_event":
+            if self._broadcaster:
+                await self._broadcaster.broadcast_event(
+                    str(data.get("name", "")),
+                    data.get("data") or {},
+                )
+            return
+        if msg_type != "send":
             return
         chat_id = str(data.get("chat_id", ""))
         text = str(data.get("text", ""))
